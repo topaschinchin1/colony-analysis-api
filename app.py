@@ -1,7 +1,7 @@
 """
 Colony Counting and Hemolysis Detection API
-Maximum sensitivity version
-Version: 1.5.0
+Balanced sensitivity version
+Version: 1.5.1
 """
 
 import os
@@ -14,8 +14,8 @@ from PIL import Image
 
 app = Flask(__name__)
 
-# Configuration - MAXIMUM SENSITIVITY
-MAX_IMAGE_SIZE = 900  # Even larger for tiny colony detection
+# Configuration - BALANCED
+MAX_IMAGE_SIZE = 850  # Between 800 and 900
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
 
 
@@ -43,7 +43,7 @@ def get_luminance(rgb_array):
 
 
 def enhanced_colony_detection(rgb_array, luminance, plate_mask):
-    """MAXIMUM SENSITIVITY colony detection - target ~189 CFU"""
+    """BALANCED colony detection - v1.5.1 targeting ~189 CFU"""
     from scipy import ndimage
     from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
     
@@ -52,8 +52,8 @@ def enhanced_colony_detection(rgb_array, luminance, plate_mask):
     background = np.median(plate_pixels)
     std_dev = np.std(plate_pixels)
     
-    # Method 1: Luminance-based - VERY SENSITIVE
-    bright_threshold = background + (0.6 * std_dev)  # Was 0.8, now 0.6
+    # Method 1: Luminance-based - BALANCED
+    bright_threshold = background + (0.7 * std_dev)  # Between 0.6 and 0.8
     bright_colonies = (luminance > bright_threshold) & plate_mask
     
     # Method 2: Detect whitish colonies
@@ -62,43 +62,43 @@ def enhanced_colony_detection(rgb_array, luminance, plate_mask):
     plate_brightness = brightness[plate_mask]
     bright_median = np.median(plate_brightness)
     
-    # Even lower threshold
-    is_bright = brightness > (bright_median + 8)  # Was +12, now +8
+    # Balanced threshold
+    is_bright = brightness > (bright_median + 10)  # Between 8 and 12
     
     # Not too red
     red_ratio = r.astype(float) / (brightness + 1)
-    not_too_red = red_ratio < 1.2  # Was 1.25, now 1.2
+    not_too_red = red_ratio < 1.22  # Between 1.2 and 1.25
     
     white_colonies = is_bright & not_too_red & plate_mask
     
-    # Method 3: Local maxima - FINEST detection
-    blurred = gaussian_filter(luminance.astype(float), sigma=1.0)  # Was 1.5, now 1.0
-    local_max = maximum_filter(blurred, size=4)  # Was 5, now 4
-    peaks = (blurred == local_max) & (luminance > background + std_dev * 0.3) & plate_mask  # Was 0.5, now 0.3
+    # Method 3: Local maxima - BALANCED
+    blurred = gaussian_filter(luminance.astype(float), sigma=1.2)  # Between 1.0 and 1.5
+    local_max = maximum_filter(blurred, size=5)  # Keep at 5
+    peaks = (blurred == local_max) & (luminance > background + std_dev * 0.4) & plate_mask  # Between 0.3 and 0.5
     
-    # Dilate peaks slightly
-    dilated_peaks = ndimage.binary_dilation(peaks, iterations=1)  # Was 2, now 1
+    # Dilate peaks
+    dilated_peaks = ndimage.binary_dilation(peaks, iterations=1)
     
     # Method 4: Edge-based detection
-    local_min = minimum_filter(blurred, size=7)  # Was 9, now 7
+    local_min = minimum_filter(blurred, size=8)  # Between 7 and 9
     contrast = blurred - local_min
-    high_contrast = (contrast > std_dev * 0.3) & plate_mask  # Was 0.4, now 0.3
+    high_contrast = (contrast > std_dev * 0.35) & plate_mask  # Between 0.3 and 0.4
     
-    # Method 5: Adaptive threshold - catch colonies missed by global threshold
-    # Use local mean comparison
-    local_mean = ndimage.uniform_filter(luminance.astype(float), size=15)
-    above_local = (luminance > local_mean + 5) & plate_mask
+    # SKIP adaptive threshold - it was adding too much noise
     
-    # Combine ALL methods
-    combined_mask = bright_colonies | white_colonies | dilated_peaks | high_contrast | above_local
+    # Combine methods
+    combined_mask = bright_colonies | white_colonies | dilated_peaks | high_contrast
+    
+    # Light cleanup to remove noise specks
+    combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
     
     # Label connected components
     labeled, num_features = ndimage.label(combined_mask)
     
-    # Filter by size - MINIMUM threshold
+    # Filter by size - slightly higher minimum to filter noise
     valid_colonies = 0
     colony_sizes = []
-    min_size = 2   # Was 3, now 2 - catch even tinier colonies
+    min_size = 4   # Back to 4 to filter tiny noise
     max_size = 5000
     
     for i in range(1, num_features + 1):
@@ -256,7 +256,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'radius_px': radius,
             'analyzed_size': list(img.shape[:2])
         },
-        'version': '1.5.0-maximum'
+        'version': '1.5.1-balanced'
     }
 
 
@@ -265,10 +265,10 @@ def health():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.5.0-maximum',
+        'version': '1.5.1-balanced',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
-        'calibration': 'Maximum sensitivity - tuned for 189 CFU reference plate'
+        'calibration': 'Balanced sensitivity - tuned for 189 CFU reference plate'
     })
 
 
