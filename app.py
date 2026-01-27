@@ -491,7 +491,6 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
         },
         'version': '1.5.9-v153-restored'
     }
-    }
 
 
 @app.route('/health', methods=['GET'])
