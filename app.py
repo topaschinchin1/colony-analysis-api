@@ -1,310 +1,214 @@
 """
-Colony Counting and Hemolysis Detection API - MEMORY OPTIMIZED
-Optimized for Render free tier (512MB RAM)
-Version: 1.1.0
+Colony Counting and Hemolysis Detection API
+Calibrated version - improved sensitivity
+Version: 1.3.0
 """
 
 import os
-import tempfile
 import traceback
+import base64
+from io import BytesIO
 from flask import Flask, request, jsonify
 import numpy as np
 from PIL import Image
-import io as python_io
 
 app = Flask(__name__)
 
-# Configuration
-MAX_IMAGE_SIZE = 600  # Reduced from 800 for memory safety
+# Configuration - CALIBRATED
+MAX_IMAGE_SIZE = 700  # Increased for better small colony detection
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
 
-def resize_image_pil(image_bytes, max_size=MAX_IMAGE_SIZE):
-    """Resize image using PIL (more memory efficient than skimage)"""
-    img = Image.open(python_io.BytesIO(image_bytes))
+
+def load_and_resize_image(image_bytes):
+    """Load image and resize to manageable size"""
+    img = Image.open(BytesIO(image_bytes))
     
-    # Convert to RGB if necessary
-    if img.mode == 'RGBA':
-        img = img.convert('RGB')
-    elif img.mode != 'RGB':
+    # Convert to RGB
+    if img.mode != 'RGB':
         img = img.convert('RGB')
     
     # Resize if needed
     w, h = img.size
-    if max(w, h) > max_size:
-        scale = max_size / max(w, h)
+    if max(w, h) > MAX_IMAGE_SIZE:
+        scale = MAX_IMAGE_SIZE / max(w, h)
         new_w, new_h = int(w * scale), int(h * scale)
         img = img.resize((new_w, new_h), Image.LANCZOS)
     
     return np.array(img)
 
-def rgb_to_lab_simple(rgb_array):
-    """Simple RGB to LAB conversion without heavy dependencies"""
-    # Normalize RGB to 0-1
-    rgb = rgb_array.astype(np.float32) / 255.0
-    
-    # Simplified LAB approximation
-    # L = lightness (0-100)
-    L = 0.2126 * rgb[:,:,0] + 0.7152 * rgb[:,:,1] + 0.0722 * rgb[:,:,2]
-    L = L * 100
-    
-    # a = green-red (-128 to 127)
-    a = (rgb[:,:,0] - rgb[:,:,1]) * 128
-    
-    # b = blue-yellow (-128 to 127)  
-    b = (rgb[:,:,1] - rgb[:,:,2]) * 128
-    
-    return L, a, b
 
-def detect_plate_region(L_channel):
-    """Detect the circular plate region"""
-    h, w = L_channel.shape
-    center_y, center_x = h // 2, w // 2
-    radius = min(h, w) // 2 - 10
-    
-    # Create circular mask
-    y_grid, x_grid = np.ogrid[:h, :w]
-    dist_from_center = np.sqrt((x_grid - center_x)**2 + (y_grid - center_y)**2)
-    plate_mask = dist_from_center <= radius * 0.95
-    
-    return plate_mask, (center_x, center_y), radius
+def get_luminance(rgb_array):
+    """Calculate luminance from RGB"""
+    return 0.299 * rgb_array[:,:,0] + 0.587 * rgb_array[:,:,1] + 0.114 * rgb_array[:,:,2]
 
-def simple_colony_detection(L_channel, plate_mask):
-    """Simple threshold-based colony detection (memory efficient)"""
+
+def enhanced_colony_detection(rgb_array, luminance, plate_mask):
+    """Enhanced colony detection with multiple methods"""
     from scipy import ndimage
+    from scipy.ndimage import gaussian_filter, maximum_filter
     
-    # Work only within plate region
-    masked_L = L_channel.copy()
-    masked_L[~plate_mask] = 0
+    # Get plate region statistics
+    plate_pixels = luminance[plate_mask]
+    background = np.median(plate_pixels)
+    std_dev = np.std(plate_pixels)
     
-    # Calculate background (median of plate region)
-    plate_values = L_channel[plate_mask]
-    background = np.median(plate_values)
+    # Method 1: Luminance-based (bright colonies on dark background)
+    # CALIBRATED: Lower threshold for better sensitivity
+    bright_threshold = background + (1.2 * std_dev)
+    bright_colonies = (luminance > bright_threshold) & plate_mask
     
-    # Colonies are typically darker OR lighter than background
-    # For blood agar, colonies are often lighter (cleared zones)
-    threshold_high = background + 15
-    threshold_low = background - 20
+    # Method 2: Detect whitish colonies specifically
+    r, g, b = rgb_array[:,:,0], rgb_array[:,:,1], rgb_array[:,:,2]
     
-    # Binary mask of potential colonies
-    colony_mask = ((masked_L > threshold_high) | (masked_L < threshold_low)) & plate_mask
+    # White/light colonies: high overall brightness
+    brightness = (r.astype(float) + g.astype(float) + b.astype(float)) / 3
+    is_bright = brightness > (np.median(brightness[plate_mask]) + 20)
+    
+    # Not too red (to distinguish from blood agar background)
+    red_ratio = r.astype(float) / (brightness + 1)
+    not_too_red = red_ratio < 1.3
+    
+    white_colonies = is_bright & not_too_red & plate_mask
+    
+    # Method 3: Local contrast detection - find local maxima
+    blurred = gaussian_filter(luminance.astype(float), sigma=2)
+    local_max = maximum_filter(blurred, size=7)
+    peaks = (blurred == local_max) & (luminance > background + std_dev * 0.8) & plate_mask
+    
+    # Dilate peaks to get colony regions
+    dilated_peaks = ndimage.binary_dilation(peaks, iterations=2)
+    
+    # Combine all methods
+    combined_mask = bright_colonies | white_colonies | dilated_peaks
+    
+    # Clean up with morphological operations
+    combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
     
     # Label connected components
-    labeled_array, num_features = ndimage.label(colony_mask)
+    labeled, num_features = ndimage.label(combined_mask)
     
-    # Filter by size
-    colonies = []
-    min_area = 20
-    max_area = 5000
+    # Filter by size - CALIBRATED for small colonies
+    valid_colonies = 0
+    colony_sizes = []
+    min_size = 4   # Catch smaller colonies
+    max_size = 3000
     
     for i in range(1, num_features + 1):
-        component_mask = labeled_array == i
-        area = np.sum(component_mask)
-        
-        if min_area <= area <= max_area:
-            # Get centroid
-            coords = np.where(component_mask)
-            cy, cx = np.mean(coords[0]), np.mean(coords[1])
-            
-            # Calculate circularity
-            perimeter = np.sum(ndimage.binary_dilation(component_mask) & ~component_mask)
-            circularity = 4 * np.pi * area / (perimeter ** 2 + 1)
-            
-            if circularity > 0.2:  # Reasonably circular
-                colonies.append({
-                    'center': (int(cx), int(cy)),
-                    'area': int(area),
-                    'circularity': float(circularity),
-                    'diameter_px': float(np.sqrt(area / np.pi) * 2)
-                })
+        size = np.sum(labeled == i)
+        if min_size <= size <= max_size:
+            valid_colonies += 1
+            colony_sizes.append(size)
     
-    return colonies, labeled_array
+    avg_size = np.mean(colony_sizes) if colony_sizes else 0
+    
+    return valid_colonies, avg_size, labeled
 
-def analyze_hemolysis(L_channel, a_channel, colonies, plate_mask, background_L, background_a):
-    """Analyze hemolysis zones around colonies"""
-    if not colonies:
-        return {'type': 'none', 'confidence': 0, 'details': {}}
+
+def detect_hemolysis_calibrated(rgb_array, luminance, plate_mask):
+    """Calibrated hemolysis detection - looks for clear zones"""
     
-    beta_count = 0
-    alpha_count = 0
-    gamma_count = 0
+    r = rgb_array[:,:,0].astype(float)
+    g = rgb_array[:,:,1].astype(float)
+    b = rgb_array[:,:,2].astype(float)
     
-    h, w = L_channel.shape
+    # Blood agar background is RED
+    # Beta hemolysis = CLEAR zones (less red, more transparent/yellow)
+    plate_r = r[plate_mask]
+    bg_red = np.median(plate_r)
+    bg_green = np.median(g[plate_mask])
     
-    for colony in colonies:
-        cx, cy = colony['center']
-        radius = int(colony['diameter_px'] / 2) + 5
-        
-        # Define annular region around colony
-        inner_r = radius
-        outer_r = radius + 15
-        
-        y_grid, x_grid = np.ogrid[max(0,cy-outer_r):min(h,cy+outer_r), 
-                                   max(0,cx-outer_r):min(w,cx+outer_r)]
-        
-        # Adjust coordinates for local patch
-        local_cy = cy - max(0, cy-outer_r)
-        local_cx = cx - max(0, cx-outer_r)
-        
-        dist = np.sqrt((x_grid - local_cx)**2 + (y_grid - local_cy)**2)
-        ring_mask = (dist >= inner_r) & (dist <= outer_r)
-        
-        if np.sum(ring_mask) < 10:
-            gamma_count += 1
-            continue
-        
-        # Get L* and a* values in ring
-        L_patch = L_channel[max(0,cy-outer_r):min(h,cy+outer_r), 
-                           max(0,cx-outer_r):min(w,cx+outer_r)]
-        a_patch = a_channel[max(0,cy-outer_r):min(h,cy+outer_r),
-                           max(0,cx-outer_r):min(w,cx+outer_r)]
-        
-        if L_patch.shape != ring_mask.shape:
-            gamma_count += 1
-            continue
-            
-        ring_L = np.mean(L_patch[ring_mask])
-        ring_a = np.mean(a_patch[ring_mask])
-        
-        # Classification
-        L_diff = ring_L - background_L
-        a_diff = ring_a - background_a
-        
-        if L_diff > 8:  # Significantly lighter = beta
-            beta_count += 1
-        elif a_diff < -3:  # Green shift = alpha
-            alpha_count += 1
-        else:
-            gamma_count += 1
+    # BETA HEMOLYSIS: Clear/yellow zones - reduced red but still bright
+    red_reduction = r < (bg_red * 0.85)
+    brightness = (r + g + b) / 3
+    still_bright = brightness > (np.median(brightness[plate_mask]) * 0.7)
+    beta_zones = red_reduction & still_bright & plate_mask
     
-    total = beta_count + alpha_count + gamma_count
-    if total == 0:
-        return {'type': 'none', 'confidence': 0, 'details': {}}
+    beta_ratio = np.sum(beta_zones) / np.sum(plate_mask)
     
-    # Determine dominant type
-    if beta_count >= total * 0.5:
+    # ALPHA HEMOLYSIS: Greenish zones
+    green_shift = (g > r * 0.9) & (g > bg_green * 1.1)
+    alpha_zones = green_shift & plate_mask
+    
+    alpha_ratio = np.sum(alpha_zones) / np.sum(plate_mask)
+    
+    # Classification - CALIBRATED thresholds
+    if beta_ratio > 0.08:
         hemo_type = 'beta'
-        confidence = beta_count / total
-    elif alpha_count >= total * 0.5:
+        confidence = min(0.95, 0.5 + beta_ratio * 3)
+    elif alpha_ratio > 0.05:
         hemo_type = 'alpha'
-        confidence = alpha_count / total
-    elif gamma_count >= total * 0.6:
-        hemo_type = 'gamma'
-        confidence = gamma_count / total
+        confidence = min(0.90, 0.5 + alpha_ratio * 4)
     else:
-        hemo_type = 'mixed'
-        confidence = max(beta_count, alpha_count, gamma_count) / total
+        hemo_type = 'gamma'
+        confidence = 0.6
     
     return {
         'type': hemo_type,
         'confidence': round(confidence, 4),
         'details': {
-            'beta_count': beta_count,
-            'alpha_count': alpha_count,
-            'gamma_count': gamma_count,
-            'beta_percent': round(100 * beta_count / total, 2) if total > 0 else 0
+            'beta_zone_ratio': round(beta_ratio, 4),
+            'alpha_zone_ratio': round(alpha_ratio, 4)
         }
     }
 
-def generate_decision_label(colony_count, hemolysis, artifacts, media_type):
-    """Generate clinical decision support label"""
+
+def create_plate_mask(shape):
+    """Create circular plate mask"""
+    h, w = shape[:2]
+    center_y, center_x = h // 2, w // 2
+    radius = min(h, w) // 2 - 5
     
-    # Growth classification
+    y, x = np.ogrid[:h, :w]
+    dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+    mask = dist <= radius * 0.92
+    
+    return mask, (center_x, center_y), radius
+
+
+def generate_decision(colony_count, hemolysis, media_type):
+    """Generate decision label"""
     if colony_count <= 3:
         growth = "No growth"
         confidence = "HIGH"
-        requires_review = False
+        review = False
     elif colony_count <= 20:
-        growth = f"Low colony count ({colony_count} CFU)"
+        growth = f"Low count ({colony_count} CFU)"
         confidence = "MEDIUM"
-        requires_review = True
+        review = True
     elif colony_count <= 50:
         growth = f"Moderate growth ({colony_count} CFU)"
         confidence = "HIGH"
-        requires_review = False
+        review = False
     else:
         growth = f"Significant growth ({colony_count} CFU)"
         confidence = "HIGH"
-        requires_review = False
+        review = False
     
-    # Build label
     label_parts = [growth]
-    
-    # Add hemolysis info for blood agar
-    if media_type == 'blood_agar' and hemolysis['type'] != 'none':
-        hemo_type = hemolysis['type']
-        if hemo_type == 'beta':
-            label_parts.append("beta-hemolytic")
-            label_parts.append("follow Strep workup protocol")
-        elif hemo_type == 'alpha':
-            label_parts.append("alpha-hemolytic")
-            label_parts.append("rule out S. pneumoniae")
-        elif hemo_type == 'gamma':
-            label_parts.append("non-hemolytic")
-        elif hemo_type == 'mixed':
-            label_parts.append("mixed hemolysis")
-            requires_review = True
-    
-    # Artifact warning
-    if artifacts:
-        requires_review = True
-    
-    decision_label = " – ".join(label_parts)
+    if media_type == 'blood_agar' and hemolysis['type'] in ['alpha', 'beta']:
+        if hemolysis['type'] == 'beta':
+            label_parts.append("beta-hemolytic – follow Strep protocol")
+        elif hemolysis['type'] == 'alpha':
+            label_parts.append("alpha-hemolytic – rule out S. pneumoniae")
+    elif media_type == 'blood_agar':
+        label_parts.append("non-hemolytic")
     
     return {
-        'label': decision_label,
+        'label': " – ".join(label_parts),
         'confidence': confidence,
-        'requires_review': requires_review
+        'requires_review': review
     }
 
+
 def analyze_plate(image_bytes, media_type='blood_agar'):
-    """Main analysis function - memory optimized"""
+    """Main analysis function - calibrated version"""
+    img = load_and_resize_image(image_bytes)
+    plate_mask, center, radius = create_plate_mask(img.shape)
+    luminance = get_luminance(img)
     
-    # Step 1: Load and resize image (PIL is more memory efficient)
-    img_array = resize_image_pil(image_bytes)
-    
-    # Step 2: Convert to LAB color space (simplified)
-    L_channel, a_channel, b_channel = rgb_to_lab_simple(img_array)
-    
-    # Step 3: Detect plate region
-    plate_mask, center, radius = detect_plate_region(L_channel)
-    
-    # Step 4: Calculate background values
-    background_L = np.median(L_channel[plate_mask])
-    background_a = np.median(a_channel[plate_mask])
-    
-    # Step 5: Detect colonies
-    from scipy import ndimage  # Import here to delay loading
-    colonies, labeled = simple_colony_detection(L_channel, plate_mask)
-    
-    # Step 6: Analyze hemolysis (blood agar only)
-    if media_type == 'blood_agar':
-        hemolysis = analyze_hemolysis(L_channel, a_channel, colonies, 
-                                       plate_mask, background_L, background_a)
-    else:
-        hemolysis = {'type': 'none', 'confidence': 0, 'details': {}}
-    
-    # Step 7: Detect artifacts (simplified)
-    artifacts = []
-    high_L_ratio = np.sum(L_channel[plate_mask] > 80) / np.sum(plate_mask)
-    if high_L_ratio > 0.3:
-        artifacts.append('possible_glare_or_reflection')
-    
-    # Step 8: Generate decision label
-    colony_count = len(colonies)
-    decision = generate_decision_label(colony_count, hemolysis, artifacts, media_type)
-    
-    # Step 9: Calculate statistics
-    if colonies:
-        areas = [c['area'] for c in colonies]
-        circularities = [c['circularity'] for c in colonies]
-        diameters = [c['diameter_px'] for c in colonies]
-        stats = {
-            'mean_area': round(np.mean(areas), 2),
-            'mean_circularity': round(np.mean(circularities), 3),
-            'mean_diameter_px': round(np.mean(diameters), 1)
-        }
-    else:
-        stats = {'mean_area': 0, 'mean_circularity': 0, 'mean_diameter_px': 0}
+    colony_count, avg_size, labeled = enhanced_colony_detection(img, luminance, plate_mask)
+    hemolysis = detect_hemolysis_calibrated(img, luminance, plate_mask)
+    decision = generate_decision(colony_count, hemolysis, media_type)
     
     return {
         'status': 'success',
@@ -313,81 +217,65 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
         'decision_confidence': decision['confidence'],
         'requires_manual_review': decision['requires_review'],
         'hemolysis': hemolysis,
-        'colony_statistics': stats,
-        'artifacts_detected': artifacts,
+        'colony_statistics': {
+            'average_size_px': round(avg_size, 1)
+        },
         'plate_info': {
             'center': list(center),
             'radius_px': radius,
-            'image_size': list(img_array.shape[:2])
-        }
+            'analyzed_size': list(img.shape[:2])
+        },
+        'version': '1.3.0-calibrated'
     }
 
 
 @app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
+def health():
+    """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.1.0-optimized',
-        'description': 'Colony Counting and Hemolysis Detection API (Memory Optimized)',
-        'endpoints': {
-            '/health': 'GET - Health check',
-            '/analyze': 'POST - Analyze plate image'
-        },
-        'supported_media_types': SUPPORTED_MEDIA_TYPES,
+        'version': '1.3.0-calibrated',
         'max_image_size': MAX_IMAGE_SIZE,
-        'decision_thresholds': {
-            'no_growth': '≤ 3 CFU',
-            'low_count': '≤ 20 CFU',
-            'significant': '> 50 CFU'
-        }
+        'supported_media_types': SUPPORTED_MEDIA_TYPES,
+        'calibration': 'Tuned for blood agar plates with white colonies'
     })
 
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    """Analyze plate image endpoint"""
+    """Analyze plate image"""
     try:
-        # Get media type
         media_type = request.form.get('media_type', 'blood_agar')
         if media_type not in SUPPORTED_MEDIA_TYPES:
             media_type = 'blood_agar'
         
-        # Get image
-        image_bytes = None
-        
-        # Check for file upload
         if 'image' in request.files:
             file = request.files['image']
-            if file.filename:
+            if file and file.filename:
                 image_bytes = file.read()
+                result = analyze_plate(image_bytes, media_type)
+                return jsonify(result)
         
-        # Check for base64
-        if image_bytes is None and request.is_json:
+        if request.is_json:
             data = request.get_json()
             if data and 'image_base64' in data:
-                import base64
                 image_bytes = base64.b64decode(data['image_base64'])
+                result = analyze_plate(image_bytes, media_type)
+                return jsonify(result)
         
-        if image_bytes is None:
-            return jsonify({
-                'status': 'error',
-                'error': 'No image provided. Send as "image" file or "image_base64" in JSON.'
-            }), 400
-        
-        # Analyze
-        result = analyze_plate(image_bytes, media_type)
-        return jsonify(result)
+        return jsonify({
+            'status': 'error',
+            'error': 'No image provided. Send as "image" file or "image_base64" in JSON.'
+        }), 400
         
     except Exception as e:
-        traceback.print_exc()
         return jsonify({
             'status': 'error',
             'error': str(e),
-            'traceback': traceback.format_exc()
+            'trace': traceback.format_exc()
         }), 500
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port)
