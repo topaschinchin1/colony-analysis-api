@@ -1,7 +1,7 @@
 """
 Colony Counting and Hemolysis Detection API
-Balanced sensitivity version
-Version: 1.5.1
+Smart plate detection + strict filtering
+Version: 1.5.2
 """
 
 import os
@@ -14,8 +14,8 @@ from PIL import Image
 
 app = Flask(__name__)
 
-# Configuration - BALANCED
-MAX_IMAGE_SIZE = 850  # Between 800 and 900
+# Configuration - SMART DETECTION
+MAX_IMAGE_SIZE = 800
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
 
 
@@ -23,11 +23,9 @@ def load_and_resize_image(image_bytes):
     """Load image and resize to manageable size"""
     img = Image.open(BytesIO(image_bytes))
     
-    # Convert to RGB
     if img.mode != 'RGB':
         img = img.convert('RGB')
     
-    # Resize if needed
     w, h = img.size
     if max(w, h) > MAX_IMAGE_SIZE:
         scale = MAX_IMAGE_SIZE / max(w, h)
@@ -42,70 +40,125 @@ def get_luminance(rgb_array):
     return 0.299 * rgb_array[:,:,0] + 0.587 * rgb_array[:,:,1] + 0.114 * rgb_array[:,:,2]
 
 
-def enhanced_colony_detection(rgb_array, luminance, plate_mask):
-    """BALANCED colony detection - v1.5.1 targeting ~189 CFU"""
-    from scipy import ndimage
-    from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
+def detect_blood_agar_region(rgb_array):
+    """Detect the RED blood agar region using color analysis"""
+    r = rgb_array[:,:,0].astype(float)
+    g = rgb_array[:,:,1].astype(float)
+    b = rgb_array[:,:,2].astype(float)
     
-    # Get plate region statistics
+    # Blood agar is RED - high red, lower green/blue
+    # Red dominant: R > G and R > B
+    red_dominant = (r > g * 1.1) & (r > b * 1.1)
+    
+    # Not too dark, not too bright (exclude shadows and highlights)
+    brightness = (r + g + b) / 3
+    good_brightness = (brightness > 60) & (brightness < 220)
+    
+    # Combine criteria
+    agar_region = red_dominant & good_brightness
+    
+    # Clean up with morphological operations
+    from scipy import ndimage
+    agar_region = ndimage.binary_closing(agar_region, iterations=5)
+    agar_region = ndimage.binary_opening(agar_region, iterations=3)
+    
+    # Fill holes
+    agar_region = ndimage.binary_fill_holes(agar_region)
+    
+    return agar_region
+
+
+def create_plate_mask(shape, rgb_array=None):
+    """Create plate mask - use color detection if available"""
+    h, w = shape[:2]
+    center_y, center_x = h // 2, w // 2
+    radius = min(h, w) // 2 - 5
+    
+    # Basic circular mask
+    y, x = np.ogrid[:h, :w]
+    dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+    circular_mask = dist <= radius * 0.90  # Conservative circle
+    
+    # If we have RGB data, use color-based detection too
+    if rgb_array is not None:
+        color_mask = detect_blood_agar_region(rgb_array)
+        # Combine: must be within circle AND be red agar
+        combined_mask = circular_mask & color_mask
+        
+        # If color detection found a reasonable region, use it
+        if np.sum(combined_mask) > np.sum(circular_mask) * 0.3:
+            return combined_mask, (center_x, center_y), radius
+    
+    return circular_mask, (center_x, center_y), radius
+
+
+def enhanced_colony_detection(rgb_array, luminance, plate_mask):
+    """STRICT colony detection with circularity filtering"""
+    from scipy import ndimage
+    from scipy.ndimage import gaussian_filter, maximum_filter
+    
     plate_pixels = luminance[plate_mask]
     background = np.median(plate_pixels)
     std_dev = np.std(plate_pixels)
     
-    # Method 1: Luminance-based - BALANCED
-    bright_threshold = background + (0.7 * std_dev)  # Between 0.6 and 0.8
+    # Method 1: Luminance-based - CONSERVATIVE threshold
+    bright_threshold = background + (1.0 * std_dev)  # Back to 1.0
     bright_colonies = (luminance > bright_threshold) & plate_mask
     
-    # Method 2: Detect whitish colonies
+    # Method 2: White colony detection - STRICTER
     r, g, b = rgb_array[:,:,0], rgb_array[:,:,1], rgb_array[:,:,2]
     brightness = (r.astype(float) + g.astype(float) + b.astype(float)) / 3
     plate_brightness = brightness[plate_mask]
     bright_median = np.median(plate_brightness)
     
-    # Balanced threshold
-    is_bright = brightness > (bright_median + 10)  # Between 8 and 12
+    is_bright = brightness > (bright_median + 15)  # Raised from +10
     
-    # Not too red
+    # Must NOT be red (colonies are white/cream, not red like agar)
     red_ratio = r.astype(float) / (brightness + 1)
-    not_too_red = red_ratio < 1.22  # Between 1.2 and 1.25
+    not_red = red_ratio < 1.15  # Stricter
     
-    white_colonies = is_bright & not_too_red & plate_mask
+    white_colonies = is_bright & not_red & plate_mask
     
-    # Method 3: Local maxima - BALANCED
-    blurred = gaussian_filter(luminance.astype(float), sigma=1.2)  # Between 1.0 and 1.5
-    local_max = maximum_filter(blurred, size=5)  # Keep at 5
-    peaks = (blurred == local_max) & (luminance > background + std_dev * 0.4) & plate_mask  # Between 0.3 and 0.5
+    # Method 3: Local maxima - LESS SENSITIVE
+    blurred = gaussian_filter(luminance.astype(float), sigma=1.5)
+    local_max = maximum_filter(blurred, size=6)
+    peaks = (blurred == local_max) & (luminance > background + std_dev * 0.6) & plate_mask
     
-    # Dilate peaks
     dilated_peaks = ndimage.binary_dilation(peaks, iterations=1)
     
-    # Method 4: Edge-based detection
-    local_min = minimum_filter(blurred, size=8)  # Between 7 and 9
-    contrast = blurred - local_min
-    high_contrast = (contrast > std_dev * 0.35) & plate_mask  # Between 0.3 and 0.4
-    
-    # SKIP adaptive threshold - it was adding too much noise
-    
     # Combine methods
-    combined_mask = bright_colonies | white_colonies | dilated_peaks | high_contrast
+    combined_mask = bright_colonies | white_colonies | dilated_peaks
     
-    # Light cleanup to remove noise specks
+    # Morphological cleanup - AGGRESSIVE
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
+    combined_mask = ndimage.binary_closing(combined_mask, iterations=1)
     
     # Label connected components
     labeled, num_features = ndimage.label(combined_mask)
     
-    # Filter by size - slightly higher minimum to filter noise
+    # Filter by size AND CIRCULARITY
     valid_colonies = 0
     colony_sizes = []
-    min_size = 4   # Back to 4 to filter tiny noise
-    max_size = 5000
+    min_size = 6    # Raised from 4
+    max_size = 4000
+    min_circularity = 0.3  # Must be somewhat round
     
     for i in range(1, num_features + 1):
-        size = np.sum(labeled == i)
+        component = labeled == i
+        size = np.sum(component)
+        
         if min_size <= size <= max_size:
-            valid_colonies += 1
-            colony_sizes.append(size)
+            # Calculate circularity
+            perimeter = np.sum(ndimage.binary_dilation(component) & ~component)
+            if perimeter > 0:
+                circularity = 4 * np.pi * size / (perimeter ** 2)
+            else:
+                circularity = 0
+            
+            # Must be reasonably circular
+            if circularity >= min_circularity:
+                valid_colonies += 1
+                colony_sizes.append(size)
     
     avg_size = np.mean(colony_sizes) if colony_sizes else 0
     
@@ -232,9 +285,15 @@ def generate_decision(colony_count, hemolysis, media_type):
 
 
 def analyze_plate(image_bytes, media_type='blood_agar'):
-    """Main analysis function - calibrated version"""
+    """Main analysis function - v1.5.2 with smart plate detection"""
     img = load_and_resize_image(image_bytes)
-    plate_mask, center, radius = create_plate_mask(img.shape)
+    
+    # Use color-aware plate mask for blood agar
+    if media_type == 'blood_agar':
+        plate_mask, center, radius = create_plate_mask(img.shape, rgb_array=img)
+    else:
+        plate_mask, center, radius = create_plate_mask(img.shape)
+    
     luminance = get_luminance(img)
     
     colony_count, avg_size, labeled = enhanced_colony_detection(img, luminance, plate_mask)
@@ -256,7 +315,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'radius_px': radius,
             'analyzed_size': list(img.shape[:2])
         },
-        'version': '1.5.1-balanced'
+        'version': '1.5.2-smart'
     }
 
 
@@ -265,10 +324,10 @@ def health():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.5.1-balanced',
+        'version': '1.5.2-smart',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
-        'calibration': 'Balanced sensitivity - tuned for 189 CFU reference plate'
+        'calibration': 'Smart plate detection + circularity filtering'
     })
 
 
