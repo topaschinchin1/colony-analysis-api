@@ -1,7 +1,11 @@
 """
 Colony Counting and Hemolysis Detection API
-Smart plate detection + strict filtering
-Version: 1.5.2
+Version: 1.5.3 - Research-based improvements
+
+Based on:
+- OpenCFU: Recursive thresholding + watershed segmentation
+- CFUCounter: Iterative adaptive thresholding + local minima watershed
+- Savardi et al.: HSV color space for hemolysis detection
 """
 
 import os
@@ -14,9 +18,15 @@ from PIL import Image
 
 app = Flask(__name__)
 
-# Configuration - SMART DETECTION
+# Configuration
 MAX_IMAGE_SIZE = 800
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
+
+# Colony detection parameters (calibrated)
+MIN_COLONY_SIZE = 8       # pixels - filter tiny noise
+MAX_COLONY_SIZE = 5000    # pixels - filter large artifacts
+MIN_CIRCULARITY = 0.25    # 0-1 scale, circles = 1.0
+BRIGHTNESS_THRESHOLD = 0.8  # std deviations above background
 
 
 def load_and_resize_image(image_bytes):
@@ -35,209 +45,366 @@ def load_and_resize_image(image_bytes):
     return np.array(img)
 
 
+def rgb_to_hsv(rgb_array):
+    """Convert RGB to HSV color space - better for color analysis"""
+    rgb = rgb_array.astype(float) / 255.0
+    r, g, b = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
+    
+    max_c = np.maximum(np.maximum(r, g), b)
+    min_c = np.minimum(np.minimum(r, g), b)
+    diff = max_c - min_c
+    
+    # Value
+    v = max_c
+    
+    # Saturation
+    s = np.where(max_c != 0, diff / max_c, 0)
+    
+    # Hue
+    h = np.zeros_like(max_c)
+    mask = diff != 0
+    
+    # Red is max
+    idx = (max_c == r) & mask
+    h[idx] = (60 * ((g[idx] - b[idx]) / diff[idx]) + 360) % 360
+    
+    # Green is max
+    idx = (max_c == g) & mask
+    h[idx] = (60 * ((b[idx] - r[idx]) / diff[idx]) + 120) % 360
+    
+    # Blue is max
+    idx = (max_c == b) & mask
+    h[idx] = (60 * ((r[idx] - g[idx]) / diff[idx]) + 240) % 360
+    
+    return np.stack([h, s * 255, v * 255], axis=-1)
+
+
 def get_luminance(rgb_array):
     """Calculate luminance from RGB"""
     return 0.299 * rgb_array[:,:,0] + 0.587 * rgb_array[:,:,1] + 0.114 * rgb_array[:,:,2]
 
 
-def detect_blood_agar_region(rgb_array):
-    """Detect the RED blood agar region using color analysis"""
-    r = rgb_array[:,:,0].astype(float)
-    g = rgb_array[:,:,1].astype(float)
-    b = rgb_array[:,:,2].astype(float)
+def detect_plate_region(rgb_array):
+    """
+    Detect blood agar plate using HSV color space
+    Blood agar: Hue ~0-30 (red), high saturation
+    """
+    hsv = rgb_to_hsv(rgb_array)
+    h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
-    # Blood agar is RED - high red, lower green/blue
-    # Red dominant: R > G and R > B
-    red_dominant = (r > g * 1.1) & (r > b * 1.1)
+    # Blood agar is RED (hue 0-30 or 330-360)
+    is_red = ((h <= 30) | (h >= 330)) & (s > 50) & (v > 40) & (v < 240)
     
-    # Not too dark, not too bright (exclude shadows and highlights)
-    brightness = (r + g + b) / 3
-    good_brightness = (brightness > 60) & (brightness < 220)
+    # Also accept orange-red range (0-40)
+    is_red_expanded = ((h <= 45) | (h >= 315)) & (s > 40) & (v > 30) & (v < 250)
     
-    # Combine criteria
-    agar_region = red_dominant & good_brightness
-    
-    # Clean up with morphological operations
     from scipy import ndimage
-    agar_region = ndimage.binary_closing(agar_region, iterations=5)
-    agar_region = ndimage.binary_opening(agar_region, iterations=3)
     
-    # Fill holes
-    agar_region = ndimage.binary_fill_holes(agar_region)
+    # Use expanded detection, clean up
+    agar_mask = ndimage.binary_closing(is_red_expanded, iterations=8)
+    agar_mask = ndimage.binary_opening(agar_mask, iterations=4)
+    agar_mask = ndimage.binary_fill_holes(agar_mask)
     
-    return agar_region
+    return agar_mask
 
 
 def create_plate_mask(shape, rgb_array=None):
-    """Create plate mask - use color detection if available"""
+    """Create plate mask combining circular and color detection"""
     h, w = shape[:2]
     center_y, center_x = h // 2, w // 2
     radius = min(h, w) // 2 - 5
     
-    # Basic circular mask
+    # Basic circular mask (fallback)
     y, x = np.ogrid[:h, :w]
     dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    circular_mask = dist <= radius * 0.90  # Conservative circle
+    circular_mask = dist <= radius * 0.88  # Conservative
     
-    # If we have RGB data, use color-based detection too
     if rgb_array is not None:
-        color_mask = detect_blood_agar_region(rgb_array)
-        # Combine: must be within circle AND be red agar
-        combined_mask = circular_mask & color_mask
+        color_mask = detect_plate_region(rgb_array)
         
-        # If color detection found a reasonable region, use it
-        if np.sum(combined_mask) > np.sum(circular_mask) * 0.3:
-            return combined_mask, (center_x, center_y), radius
+        # Combine: use color mask but only within reasonable bounds
+        combined = circular_mask & color_mask
+        
+        # If color detection got enough area, use it
+        if np.sum(combined) > np.sum(circular_mask) * 0.25:
+            return combined, (center_x, center_y), radius
     
     return circular_mask, (center_x, center_y), radius
 
 
-def enhanced_colony_detection(rgb_array, luminance, plate_mask):
-    """STRICT colony detection with circularity filtering"""
+def watershed_colony_segmentation(binary_mask, luminance):
+    """
+    Watershed segmentation to separate touching colonies
+    Based on CFUCounter approach: local minima detection + watershed
+    """
     from scipy import ndimage
-    from scipy.ndimage import gaussian_filter, maximum_filter
+    from scipy.ndimage import distance_transform_edt, label
+    
+    if np.sum(binary_mask) == 0:
+        return binary_mask, 0
+    
+    # Distance transform - peaks are colony centers
+    distance = distance_transform_edt(binary_mask)
+    
+    # Find local maxima in distance transform (colony centers)
+    from scipy.ndimage import maximum_filter
+    local_max = maximum_filter(distance, size=7)
+    peaks = (distance == local_max) & (distance > 2)
+    
+    # Label the peaks as markers
+    markers, num_markers = label(peaks)
+    
+    if num_markers == 0:
+        # No clear peaks, just use connected components
+        labeled, num_features = label(binary_mask)
+        return labeled, num_features
+    
+    # Simple watershed using distance-based region growing
+    # Assign each foreground pixel to nearest marker
+    try:
+        from scipy.ndimage import distance_transform_edt
+        
+        # For each marker, compute distance from marker
+        # Assign pixels to closest marker
+        segmented = np.zeros_like(binary_mask, dtype=int)
+        
+        for i in range(1, num_markers + 1):
+            marker_mask = markers == i
+            if np.any(marker_mask):
+                # Dilate marker to fill region
+                dist_from_marker = distance_transform_edt(~marker_mask)
+                # Will be assigned in priority order (closest wins)
+                segmented = np.where(
+                    (binary_mask) & (segmented == 0) & (dist_from_marker < 50),
+                    i,
+                    segmented
+                )
+        
+        # Fill remaining foreground pixels with nearest marker
+        remaining = binary_mask & (segmented == 0)
+        if np.any(remaining):
+            labeled_remaining, _ = label(remaining)
+            max_label = segmented.max()
+            segmented = np.where(remaining, labeled_remaining + max_label, segmented)
+            
+    except Exception:
+        # Fallback to simple labeling
+        segmented, _ = label(binary_mask)
+    
+    return segmented, segmented.max()
+
+
+def calculate_circularity(component_mask):
+    """
+    Calculate circularity of a component
+    Circularity = 4π × Area / Perimeter²
+    Perfect circle = 1.0
+    """
+    from scipy import ndimage
+    
+    area = np.sum(component_mask)
+    if area == 0:
+        return 0
+    
+    # Perimeter = pixels on boundary
+    dilated = ndimage.binary_dilation(component_mask)
+    perimeter = np.sum(dilated & ~component_mask)
+    
+    if perimeter == 0:
+        return 0
+    
+    circularity = 4 * np.pi * area / (perimeter ** 2)
+    return min(circularity, 1.0)  # Cap at 1.0
+
+
+def iterative_threshold_detection(luminance, plate_mask, rgb_array):
+    """
+    Iterative adaptive thresholding - inspired by OpenCFU
+    Try multiple thresholds and combine results
+    """
+    from scipy import ndimage
+    from scipy.ndimage import gaussian_filter
     
     plate_pixels = luminance[plate_mask]
     background = np.median(plate_pixels)
     std_dev = np.std(plate_pixels)
     
-    # Method 1: Luminance-based - CONSERVATIVE threshold
-    bright_threshold = background + (1.0 * std_dev)  # Back to 1.0
-    bright_colonies = (luminance > bright_threshold) & plate_mask
+    # Smooth to reduce noise
+    smoothed = gaussian_filter(luminance.astype(float), sigma=1.0)
     
-    # Method 2: White colony detection - STRICTER
-    r, g, b = rgb_array[:,:,0], rgb_array[:,:,1], rgb_array[:,:,2]
-    brightness = (r.astype(float) + g.astype(float) + b.astype(float)) / 3
-    plate_brightness = brightness[plate_mask]
-    bright_median = np.median(plate_brightness)
+    # Multiple threshold levels
+    thresholds = [
+        background + 0.6 * std_dev,  # Sensitive
+        background + 0.9 * std_dev,  # Medium
+        background + 1.2 * std_dev,  # Conservative
+    ]
     
-    is_bright = brightness > (bright_median + 15)  # Raised from +10
+    # Score map - accumulate detections across thresholds
+    score_map = np.zeros_like(luminance, dtype=float)
     
-    # Must NOT be red (colonies are white/cream, not red like agar)
-    red_ratio = r.astype(float) / (brightness + 1)
-    not_red = red_ratio < 1.15  # Stricter
+    for thresh in thresholds:
+        detected = (smoothed > thresh) & plate_mask
+        score_map += detected.astype(float)
     
-    white_colonies = is_bright & not_red & plate_mask
+    # Require detection at 2+ thresholds
+    combined = (score_map >= 2) & plate_mask
     
-    # Method 3: Local maxima - LESS SENSITIVE
-    blurred = gaussian_filter(luminance.astype(float), sigma=1.5)
-    local_max = maximum_filter(blurred, size=6)
-    peaks = (blurred == local_max) & (luminance > background + std_dev * 0.6) & plate_mask
+    return combined
+
+
+def colony_detection_v153(rgb_array, luminance, plate_mask):
+    """
+    Version 1.5.3 colony detection with research-based improvements:
+    1. HSV-based colony identification
+    2. Iterative thresholding (OpenCFU style)
+    3. Watershed segmentation for touching colonies
+    4. Circularity + size filtering
+    """
+    from scipy import ndimage
+    from scipy.ndimage import gaussian_filter, maximum_filter, label
     
-    dilated_peaks = ndimage.binary_dilation(peaks, iterations=1)
+    # === METHOD 1: Iterative thresholding ===
+    iterative_mask = iterative_threshold_detection(luminance, plate_mask, rgb_array)
     
-    # Combine methods
-    combined_mask = bright_colonies | white_colonies | dilated_peaks
+    # === METHOD 2: HSV-based detection ===
+    hsv = rgb_to_hsv(rgb_array)
+    h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
-    # Morphological cleanup - AGGRESSIVE
+    # Colonies are typically: low saturation (whitish/cream) and bright
+    plate_v = v[plate_mask]
+    plate_s = s[plate_mask]
+    bg_v = np.median(plate_v)
+    bg_s = np.median(plate_s)
+    
+    # Colony criteria in HSV:
+    # - Brighter than background (high V)
+    # - Less saturated than agar (colonies are cream/white, agar is red)
+    is_bright_hsv = v > (bg_v + 10)
+    is_less_saturated = s < (bg_s * 0.85)  # Much less red saturation
+    hsv_colonies = is_bright_hsv & is_less_saturated & plate_mask
+    
+    # === METHOD 3: Local maxima detection ===
+    blurred = gaussian_filter(luminance.astype(float), sigma=1.2)
+    local_max = maximum_filter(blurred, size=5)
+    
+    plate_lum = luminance[plate_mask]
+    bg_lum = np.median(plate_lum)
+    std_lum = np.std(plate_lum)
+    
+    peaks = (blurred == local_max) & (luminance > bg_lum + 0.5 * std_lum) & plate_mask
+    peaks_dilated = ndimage.binary_dilation(peaks, iterations=2)
+    
+    # === COMBINE METHODS ===
+    # Require agreement from multiple methods for robustness
+    method_agreement = (
+        iterative_mask.astype(int) + 
+        hsv_colonies.astype(int) + 
+        peaks_dilated.astype(int)
+    )
+    
+    # Accept if 2+ methods agree
+    combined_mask = (method_agreement >= 2) & plate_mask
+    
+    # Light cleanup
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
     combined_mask = ndimage.binary_closing(combined_mask, iterations=1)
     
-    # Label connected components
-    labeled, num_features = ndimage.label(combined_mask)
+    # === WATERSHED SEGMENTATION ===
+    # Separate touching colonies
+    segmented, num_segments = watershed_colony_segmentation(combined_mask, luminance)
     
-    # Filter by size AND CIRCULARITY
+    # === FILTER BY SIZE AND CIRCULARITY ===
+    if isinstance(segmented, np.ndarray) and segmented.max() > 0:
+        labeled = segmented
+        num_features = int(segmented.max())
+    else:
+        # Fallback
+        labeled, num_features = label(combined_mask)
+    
     valid_colonies = 0
     colony_sizes = []
-    min_size = 6    # Raised from 4
-    max_size = 4000
-    min_circularity = 0.3  # Must be somewhat round
+    colony_circularities = []
     
     for i in range(1, num_features + 1):
         component = labeled == i
         size = np.sum(component)
         
-        if min_size <= size <= max_size:
-            # Calculate circularity
-            perimeter = np.sum(ndimage.binary_dilation(component) & ~component)
-            if perimeter > 0:
-                circularity = 4 * np.pi * size / (perimeter ** 2)
-            else:
-                circularity = 0
+        if MIN_COLONY_SIZE <= size <= MAX_COLONY_SIZE:
+            circ = calculate_circularity(component)
             
-            # Must be reasonably circular
-            if circularity >= min_circularity:
+            if circ >= MIN_CIRCULARITY:
                 valid_colonies += 1
                 colony_sizes.append(size)
+                colony_circularities.append(circ)
     
     avg_size = np.mean(colony_sizes) if colony_sizes else 0
+    avg_circ = np.mean(colony_circularities) if colony_circularities else 0
     
-    return valid_colonies, avg_size, labeled
+    return valid_colonies, avg_size, avg_circ, labeled
 
 
-def detect_hemolysis_calibrated(rgb_array, luminance, plate_mask):
-    """FIXED hemolysis detection - clear zones = BETA hemolysis"""
+def detect_hemolysis_hsv(rgb_array, plate_mask):
+    """
+    Hemolysis detection using HSV color space
+    Based on Savardi et al. approach
     
-    r = rgb_array[:,:,0].astype(float)
-    g = rgb_array[:,:,1].astype(float)
-    b = rgb_array[:,:,2].astype(float)
+    Beta hemolysis: Clear zones (high V, low S, neutral H)
+    Alpha hemolysis: Green zones (H shifts toward green ~60-120)
+    Gamma: No change from background
+    """
+    hsv = rgb_to_hsv(rgb_array)
+    h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
-    # Blood agar background is DARK RED
-    # Beta hemolysis = CLEAR/TRANSPARENT zones (RBCs lysed completely)
-    # Alpha hemolysis = GREENISH zones (partial lysis, methemoglobin)
-    # Gamma = No change
+    # Background stats (blood agar)
+    plate_h = h[plate_mask]
+    plate_s = s[plate_mask]
+    plate_v = v[plate_mask]
     
-    plate_r = r[plate_mask]
-    plate_g = g[plate_mask]
-    plate_b = b[plate_mask]
+    bg_h = np.median(plate_h)  # Should be ~0-30 (red)
+    bg_s = np.median(plate_s)  # High saturation
+    bg_v = np.median(plate_v)  # Medium brightness
     
-    bg_red = np.median(plate_r)
-    bg_green = np.median(plate_g)
-    bg_brightness = np.median((r + g + b)[plate_mask] / 3)
+    # === BETA HEMOLYSIS ===
+    # Clear zones: very bright, desaturated (no red color)
+    # The blood is completely lysed, zone appears yellowish/clear
+    is_bright = v > (bg_v + 15)
+    is_desaturated = s < (bg_s * 0.7)  # Much less color
+    beta_zones = is_bright & is_desaturated & plate_mask
+    beta_ratio = np.sum(beta_zones) / np.sum(plate_mask) if np.sum(plate_mask) > 0 else 0
     
-    # BETA HEMOLYSIS: Clear zones are LIGHTER and LESS RED
-    # Clear zones = high brightness + reduced red saturation
-    brightness = (r + g + b) / 3
+    # === ALPHA HEMOLYSIS ===
+    # Green zones: hue shifts toward green (60-150), slightly darker
+    # Hemoglobin oxidizes to methemoglobin (green-brown)
+    is_greenish = (h > 40) & (h < 160)  # Green-yellow range
+    is_darker = v < (bg_v - 5)
+    alpha_zones = is_greenish & is_darker & plate_mask
+    alpha_ratio = np.sum(alpha_zones) / np.sum(plate_mask) if np.sum(plate_mask) > 0 else 0
     
-    # Clear zone criteria:
-    # 1. Brighter than background (cleared = more light passes through)
-    # 2. Red component reduced relative to overall brightness
-    is_brighter = brightness > (bg_brightness + 15)
-    red_saturation = r / (brightness + 1)
-    bg_red_sat = bg_red / (bg_brightness + 1)
-    less_red = red_saturation < (bg_red_sat * 0.9)
-    
-    beta_zones = is_brighter & less_red & plate_mask
-    beta_ratio = np.sum(beta_zones) / np.sum(plate_mask)
-    
-    # Also check for very bright spots (colony halos)
-    very_bright = brightness > (bg_brightness + 30)
-    bright_ratio = np.sum(very_bright & plate_mask) / np.sum(plate_mask)
-    
-    # Combined beta indicator
-    beta_indicator = beta_ratio + (bright_ratio * 0.5)
-    
-    # ALPHA HEMOLYSIS: Greenish discoloration
-    # Green becomes more prominent relative to red
-    green_dominance = g > (r * 0.95)  # Green nearly equals or exceeds red
-    darker = brightness < (bg_brightness - 5)  # Slightly darker (oxidized)
-    alpha_zones = green_dominance & darker & plate_mask
-    alpha_ratio = np.sum(alpha_zones) / np.sum(plate_mask)
-    
-    # Classification - BETA takes priority for clear zones
-    if beta_indicator > 0.05:  # Clear zones detected
+    # === CLASSIFICATION ===
+    if beta_ratio > 0.03:  # 3%+ clear zones = beta
         hemo_type = 'beta'
-        confidence = min(0.95, 0.6 + beta_indicator * 2)
-    elif alpha_ratio > 0.08:  # Green zones detected
+        confidence = min(0.95, 0.55 + beta_ratio * 3)
+    elif alpha_ratio > 0.05:  # 5%+ green zones = alpha
         hemo_type = 'alpha'
-        confidence = min(0.90, 0.5 + alpha_ratio * 3)
+        confidence = min(0.90, 0.50 + alpha_ratio * 3)
     else:
         hemo_type = 'gamma'
-        confidence = 0.6
+        confidence = 0.65
     
     return {
         'type': hemo_type,
         'confidence': round(confidence, 4),
         'details': {
             'beta_zone_ratio': round(beta_ratio, 4),
-            'bright_halo_ratio': round(bright_ratio, 4),
-            'alpha_zone_ratio': round(alpha_ratio, 4)
+            'alpha_zone_ratio': round(alpha_ratio, 4),
+            'background_hue': round(bg_h, 1),
+            'background_saturation': round(bg_s, 1)
         }
     }
 
 
 def generate_decision(colony_count, hemolysis, media_type):
-    """Generate decision label"""
+    """Generate clinical decision label"""
     if colony_count <= 3:
         growth = "No growth"
         confidence = "HIGH"
@@ -256,13 +423,14 @@ def generate_decision(colony_count, hemolysis, media_type):
         review = False
     
     label_parts = [growth]
-    if media_type == 'blood_agar' and hemolysis['type'] in ['alpha', 'beta']:
+    
+    if media_type == 'blood_agar':
         if hemolysis['type'] == 'beta':
             label_parts.append("beta-hemolytic – follow Strep protocol")
         elif hemolysis['type'] == 'alpha':
             label_parts.append("alpha-hemolytic – rule out S. pneumoniae")
-    elif media_type == 'blood_agar':
-        label_parts.append("non-hemolytic")
+        else:
+            label_parts.append("non-hemolytic")
     
     return {
         'label': " – ".join(label_parts),
@@ -272,19 +440,23 @@ def generate_decision(colony_count, hemolysis, media_type):
 
 
 def analyze_plate(image_bytes, media_type='blood_agar'):
-    """Main analysis function - v1.5.2 with smart plate detection"""
+    """Main analysis function - v1.5.3"""
     img = load_and_resize_image(image_bytes)
     
-    # Use color-aware plate mask for blood agar
-    if media_type == 'blood_agar':
-        plate_mask, center, radius = create_plate_mask(img.shape, rgb_array=img)
-    else:
-        plate_mask, center, radius = create_plate_mask(img.shape)
+    # Create plate mask with color detection
+    plate_mask, center, radius = create_plate_mask(img.shape, rgb_array=img)
     
     luminance = get_luminance(img)
     
-    colony_count, avg_size, labeled = enhanced_colony_detection(img, luminance, plate_mask)
-    hemolysis = detect_hemolysis_calibrated(img, luminance, plate_mask)
+    # Colony detection with new algorithm
+    colony_count, avg_size, avg_circ, labeled = colony_detection_v153(
+        img, luminance, plate_mask
+    )
+    
+    # Hemolysis detection with HSV
+    hemolysis = detect_hemolysis_hsv(img, plate_mask)
+    
+    # Generate decision
     decision = generate_decision(colony_count, hemolysis, media_type)
     
     return {
@@ -295,14 +467,16 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
         'requires_manual_review': decision['requires_review'],
         'hemolysis': hemolysis,
         'colony_statistics': {
-            'average_size_px': round(avg_size, 1)
+            'average_size_px': round(avg_size, 1),
+            'average_circularity': round(avg_circ, 3)
         },
         'plate_info': {
             'center': list(center),
             'radius_px': radius,
-            'analyzed_size': list(img.shape[:2])
+            'analyzed_size': list(img.shape[:2]),
+            'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
-        'version': '1.5.2-smart'
+        'version': '1.5.3-research'
     }
 
 
@@ -311,10 +485,20 @@ def health():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.5.2-smart',
+        'version': '1.5.3-research',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
-        'calibration': 'Smart plate detection + circularity filtering'
+        'algorithms': [
+            'HSV color space analysis',
+            'Iterative adaptive thresholding',
+            'Watershed segmentation',
+            'Circularity filtering'
+        ],
+        'based_on': [
+            'OpenCFU (recursive thresholding)',
+            'CFUCounter (watershed + local minima)',
+            'Savardi et al. (HSV hemolysis detection)'
+        ]
     })
 
 
