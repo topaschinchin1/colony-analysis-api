@@ -1,17 +1,18 @@
 """
 Colony Counting and Hemolysis Detection API
-Version: 1.6.4 - Tuned closer to v1.6.1 (which gave 270)
+Version: 1.7.0 - OpenCFU-inspired multi-thresholding
 
-TARGET: 189 CFU for GAS-01
-- v1.6.1: 270 (too high) - parameters were good, just slightly too sensitive
-- v1.6.2: 123 (too low)
-- v1.6.3: 123 (same as v1.6.2 - didn't help)
-- v1.6.4: Closer to v1.6.1 with minor tightening
+MAJOR CHANGES:
+1. OpenCFU-style global multi-thresholding (10 levels)
+2. Per-colony intensity validation
+3. Improved watershed with distance transform
+4. Colony merging across threshold levels
+5. Better noise filtering
 
 Based on:
-- CFUCounter: r=0.999 correlation with manual counts
-- OpenCFU: Recursive thresholding + score maps
-- Savardi et al.: HSV color space for hemolysis detection
+- OpenCFU (PLOS ONE 2013): Multi-thresholding + particle filtering
+- CFUCounter: Local minima watershed markers
+- krransby/colony-counter: Hough + Watershed pipeline
 """
 
 import os
@@ -28,11 +29,10 @@ app = Flask(__name__)
 MAX_IMAGE_SIZE = 800
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
 
-# Colony detection parameters - closer to v1.6.1
-MIN_COLONY_SIZE = 10      # same as v1.6.1
+# Colony detection parameters
+MIN_COLONY_SIZE = 8       # pixels
 MAX_COLONY_SIZE = 5000    # pixels
-MIN_CIRCULARITY = 0.25    # same as v1.6.1
-BRIGHTNESS_THRESHOLD = 0.8
+MIN_CIRCULARITY = 0.22    # slightly relaxed for watershed fragments
 
 
 def load_and_resize_image(image_bytes):
@@ -52,10 +52,7 @@ def load_and_resize_image(image_bytes):
 
 
 def apply_clahe(gray_image, clip_limit=2.0, tile_size=8):
-    """
-    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    Reduced clip_limit from 2.5 to 2.0 to reduce over-enhancement
-    """
+    """Apply CLAHE for contrast enhancement"""
     if gray_image.dtype != np.uint8:
         img_normalized = ((gray_image - gray_image.min()) / 
                          (gray_image.max() - gray_image.min() + 1e-8) * 255).astype(np.uint8)
@@ -79,7 +76,7 @@ def apply_clahe(gray_image, clip_limit=2.0, tile_size=8):
                 continue
                 
             tile = img_normalized[y1:y2, x1:x2]
-            hist, bins = np.histogram(tile.flatten(), bins=256, range=(0, 256))
+            hist, _ = np.histogram(tile.flatten(), bins=256, range=(0, 256))
             clip_threshold = clip_limit * tile.size / 256
             excess = np.sum(np.maximum(hist - clip_threshold, 0))
             hist = np.minimum(hist, clip_threshold)
@@ -89,33 +86,6 @@ def apply_clahe(gray_image, clip_limit=2.0, tile_size=8):
             result[y1:y2, x1:x2] = cdf_normalized[tile.astype(int)]
     
     return result.astype(np.uint8)
-
-
-def apply_noise_reduction(gray_image, method='median', kernel_size=3):
-    """Apply noise reduction preprocessing"""
-    from scipy import ndimage
-    
-    if method == 'median':
-        return ndimage.median_filter(gray_image, size=kernel_size)
-    elif method == 'gaussian':
-        return ndimage.gaussian_filter(gray_image, sigma=kernel_size/3)
-    else:
-        return gray_image
-
-
-def adaptive_threshold(gray_image, block_size=51, C=10, method='gaussian'):
-    """
-    Adaptive thresholding - increased C value for less sensitivity
-    """
-    from scipy import ndimage
-    
-    if method == 'gaussian':
-        local_mean = ndimage.gaussian_filter(gray_image.astype(float), sigma=block_size/6)
-    else:
-        local_mean = ndimage.uniform_filter(gray_image.astype(float), size=block_size)
-    
-    binary = gray_image > (local_mean + C)
-    return binary
 
 
 def rgb_to_hsv(rgb_array):
@@ -135,10 +105,8 @@ def rgb_to_hsv(rgb_array):
     
     idx = (max_c == r) & mask
     h[idx] = (60 * ((g[idx] - b[idx]) / diff[idx]) + 360) % 360
-    
     idx = (max_c == g) & mask
     h[idx] = (60 * ((b[idx] - r[idx]) / diff[idx]) + 120) % 360
-    
     idx = (max_c == b) & mask
     h[idx] = (60 * ((r[idx] - g[idx]) / diff[idx]) + 240) % 360
     
@@ -155,11 +123,9 @@ def detect_plate_region(rgb_array):
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
-    is_red = ((h <= 30) | (h >= 330)) & (s > 50) & (v > 40) & (v < 240)
     is_red_expanded = ((h <= 45) | (h >= 315)) & (s > 40) & (v > 30) & (v < 250)
     
     from scipy import ndimage
-    
     agar_mask = ndimage.binary_closing(is_red_expanded, iterations=8)
     agar_mask = ndimage.binary_opening(agar_mask, iterations=4)
     agar_mask = ndimage.binary_fill_holes(agar_mask)
@@ -186,64 +152,6 @@ def create_plate_mask(shape, rgb_array=None):
     return circular_mask, (center_x, center_y), radius
 
 
-def improved_watershed_segmentation(binary_mask, intensity_image):
-    """Improved watershed segmentation using peak_local_max"""
-    from scipy import ndimage
-    from scipy.ndimage import distance_transform_edt, label, maximum_filter
-    
-    if np.sum(binary_mask) == 0:
-        return np.zeros_like(binary_mask, dtype=int), 0
-    
-    distance = distance_transform_edt(binary_mask)
-    footprint_size = 9  # Increased from 7 for less fragmentation
-    local_max = maximum_filter(distance, size=footprint_size)
-    
-    # Higher threshold for peak detection
-    distance_threshold = max(3, np.percentile(distance[binary_mask], 40))
-    peaks = (distance == local_max) & (distance >= distance_threshold) & binary_mask
-    
-    if intensity_image is not None:
-        intensity_masked = np.where(binary_mask, intensity_image, 0)
-        intensity_local_max = maximum_filter(intensity_masked, size=7)
-        intensity_peaks = (intensity_masked == intensity_local_max) & binary_mask
-        peaks = peaks | (intensity_peaks & (distance > 2))
-    
-    markers, num_markers = label(peaks)
-    
-    if num_markers == 0:
-        labeled, num_features = label(binary_mask)
-        return labeled, num_features
-    
-    segmented = np.zeros_like(binary_mask, dtype=int)
-    segmented[markers > 0] = markers[markers > 0]
-    
-    marker_coords = {}
-    for i in range(1, num_markers + 1):
-        coords = np.where(markers == i)
-        if len(coords[0]) > 0:
-            marker_coords[i] = (np.mean(coords[0]), np.mean(coords[1]))
-    
-    fg_coords = np.where(binary_mask & (segmented == 0))
-    for y, x in zip(fg_coords[0], fg_coords[1]):
-        min_dist = float('inf')
-        nearest_marker = 0
-        for marker_id, (my, mx) in marker_coords.items():
-            d = (y - my)**2 + (x - mx)**2
-            if d < min_dist:
-                min_dist = d
-                nearest_marker = marker_id
-        if nearest_marker > 0 and min_dist < 2500:
-            segmented[y, x] = nearest_marker
-    
-    remaining = binary_mask & (segmented == 0)
-    if np.any(remaining):
-        remaining_labeled, num_remaining = label(remaining)
-        max_label = segmented.max()
-        segmented = np.where(remaining, remaining_labeled + max_label, segmented)
-    
-    return segmented, int(segmented.max())
-
-
 def calculate_circularity(component_mask):
     """Calculate circularity of a component"""
     from scipy import ndimage
@@ -262,42 +170,211 @@ def calculate_circularity(component_mask):
     return min(circularity, 1.0)
 
 
-def colony_detection_v161(rgb_array, luminance, plate_mask):
+def opencfu_multi_threshold(luminance, plate_mask, num_thresholds=10):
     """
-    Version 1.6.1 colony detection - TUNED to reduce overcounting
+    OpenCFU-style multi-thresholding
     
-    Changes from v1.6.0:
-    - Higher C values in adaptive thresholding (8,12,16 instead of 5,8,12)
-    - Higher weighted voting threshold (45% instead of 35%)
-    - Stricter HSV detection
-    - Larger minimum colony size
+    Apply multiple global thresholds and track detections across levels.
+    This is more robust than single-threshold approaches.
+    """
+    from scipy.ndimage import label
+    
+    plate_pixels = luminance[plate_mask]
+    min_val = np.percentile(plate_pixels, 5)
+    max_val = np.percentile(plate_pixels, 95)
+    
+    # Generate threshold levels
+    thresholds = np.linspace(min_val + 0.3 * (max_val - min_val), 
+                             min_val + 0.8 * (max_val - min_val), 
+                             num_thresholds)
+    
+    # Track colony candidates across thresholds
+    # Each candidate: (centroid_y, centroid_x, area, threshold_level)
+    all_candidates = []
+    
+    for thresh_idx, thresh in enumerate(thresholds):
+        binary = (luminance > thresh) & plate_mask
+        
+        # Label connected components
+        labeled, num_features = label(binary)
+        
+        for i in range(1, num_features + 1):
+            component = labeled == i
+            area = np.sum(component)
+            
+            if MIN_COLONY_SIZE <= area <= MAX_COLONY_SIZE:
+                # Get centroid
+                coords = np.where(component)
+                cy, cx = np.mean(coords[0]), np.mean(coords[1])
+                
+                # Get mean intensity
+                mean_intensity = np.mean(luminance[component])
+                
+                all_candidates.append({
+                    'cy': cy,
+                    'cx': cx,
+                    'area': area,
+                    'intensity': mean_intensity,
+                    'thresh_idx': thresh_idx,
+                    'mask': component
+                })
+    
+    return all_candidates, thresholds
+
+
+def merge_colony_candidates(candidates, merge_distance=15):
+    """
+    Merge colony candidates detected at different thresholds
+    
+    If two candidates are within merge_distance pixels, they're likely
+    the same colony detected at different threshold levels.
+    """
+    if not candidates:
+        return []
+    
+    # Sort by area (larger first)
+    candidates = sorted(candidates, key=lambda x: -x['area'])
+    
+    merged = []
+    used = set()
+    
+    for i, cand in enumerate(candidates):
+        if i in used:
+            continue
+        
+        # Find all candidates near this one
+        group = [cand]
+        used.add(i)
+        
+        for j, other in enumerate(candidates):
+            if j in used:
+                continue
+            
+            dist = np.sqrt((cand['cy'] - other['cy'])**2 + 
+                          (cand['cx'] - other['cx'])**2)
+            
+            if dist < merge_distance:
+                group.append(other)
+                used.add(j)
+        
+        # Merge: take average position, max area, count detections
+        merged_cand = {
+            'cy': np.mean([c['cy'] for c in group]),
+            'cx': np.mean([c['cx'] for c in group]),
+            'area': max(c['area'] for c in group),
+            'intensity': np.mean([c['intensity'] for c in group]),
+            'detection_count': len(group),  # How many thresholds detected this
+            'masks': [c['mask'] for c in group]
+        }
+        merged.append(merged_cand)
+    
+    return merged
+
+
+def watershed_separation(binary_mask, luminance):
+    """
+    Watershed segmentation for overlapping colonies
+    Uses distance transform + intensity for markers
     """
     from scipy import ndimage
-    from scipy.ndimage import gaussian_filter, maximum_filter, label
+    from scipy.ndimage import distance_transform_edt, label, maximum_filter
+    
+    if np.sum(binary_mask) == 0:
+        return np.zeros_like(binary_mask, dtype=int), 0
+    
+    # Distance transform
+    distance = distance_transform_edt(binary_mask)
+    
+    # Find local maxima as markers
+    footprint_size = 9
+    local_max = maximum_filter(distance, size=footprint_size)
+    distance_threshold = max(2, np.percentile(distance[binary_mask], 25))
+    peaks = (distance == local_max) & (distance >= distance_threshold) & binary_mask
+    
+    # Also consider intensity peaks
+    intensity_masked = np.where(binary_mask, luminance, 0)
+    intensity_local_max = maximum_filter(intensity_masked, size=7)
+    intensity_peaks = (intensity_masked == intensity_local_max) & binary_mask & (distance > 1)
+    
+    # Combine markers
+    combined_peaks = peaks | intensity_peaks
+    markers, num_markers = label(combined_peaks)
+    
+    if num_markers == 0:
+        return label(binary_mask)
+    
+    # Simple region growing from markers
+    segmented = np.zeros_like(binary_mask, dtype=int)
+    segmented[markers > 0] = markers[markers > 0]
+    
+    # Get marker centroids
+    marker_coords = {}
+    for i in range(1, num_markers + 1):
+        coords = np.where(markers == i)
+        if len(coords[0]) > 0:
+            marker_coords[i] = (np.mean(coords[0]), np.mean(coords[1]))
+    
+    # Assign each foreground pixel to nearest marker
+    fg_coords = np.where(binary_mask & (segmented == 0))
+    for y, x in zip(fg_coords[0], fg_coords[1]):
+        min_dist = float('inf')
+        nearest_marker = 0
+        for marker_id, (my, mx) in marker_coords.items():
+            d = (y - my)**2 + (x - mx)**2
+            if d < min_dist:
+                min_dist = d
+                nearest_marker = marker_id
+        if nearest_marker > 0 and min_dist < 2500:
+            segmented[y, x] = nearest_marker
+    
+    # Handle remaining pixels
+    remaining = binary_mask & (segmented == 0)
+    if np.any(remaining):
+        remaining_labeled, _ = label(remaining)
+        max_label = segmented.max()
+        segmented = np.where(remaining, remaining_labeled + max_label, segmented)
+    
+    return segmented, int(segmented.max())
+
+
+def colony_detection_v170(rgb_array, luminance, plate_mask):
+    """
+    Version 1.7.0 - OpenCFU-inspired colony detection
+    
+    Pipeline:
+    1. CLAHE preprocessing
+    2. Multi-threshold detection (OpenCFU style)
+    3. Candidate merging across thresholds
+    4. Filter by detection count (must be detected at 2+ thresholds)
+    5. Watershed for overlapping colonies
+    6. Per-colony validation (size, circularity, intensity)
+    """
+    from scipy import ndimage
+    from scipy.ndimage import label, gaussian_filter
     
     # === PREPROCESSING ===
-    denoised = apply_noise_reduction(luminance, method='median', kernel_size=3)
+    denoised = ndimage.median_filter(luminance, size=3)
     enhanced = apply_clahe(denoised.astype(np.uint8), clip_limit=2.0, tile_size=8)
     enhanced = enhanced.astype(float)
     
+    # Background statistics
     plate_pixels = enhanced[plate_mask]
-    bg_enhanced = np.median(plate_pixels)
-    std_enhanced = np.std(plate_pixels)
+    bg_mean = np.median(plate_pixels)
+    bg_std = np.std(plate_pixels)
     
-    # === METHOD 1: Adaptive thresholding - closer to v1.6.1 ===
-    adaptive_detections = np.zeros_like(luminance, dtype=float)
+    # === OPENCFU-STYLE MULTI-THRESHOLDING ===
+    candidates, thresholds = opencfu_multi_threshold(enhanced, plate_mask, num_thresholds=10)
     
-    # C values closer to v1.6.1 (8,12,16) but slightly higher
-    for block_size in [41, 61, 81]:
-        for C_val in [9, 13, 17]:
-            adaptive_mask = adaptive_threshold(enhanced, block_size=block_size, C=C_val)
-            adaptive_mask = adaptive_mask & plate_mask
-            adaptive_detections += adaptive_mask.astype(float) / 9
+    # === MERGE CANDIDATES ACROSS THRESHOLDS ===
+    merged_candidates = merge_colony_candidates(candidates, merge_distance=12)
     
-    method1_mask = (adaptive_detections >= 0.40) & plate_mask  # Same as v1.6.1
-    method1_weight = 1.2
+    # === FILTER BY DETECTION COUNT ===
+    # Colonies detected at multiple thresholds are more reliable
+    # Require detection at 2+ threshold levels
+    reliable_candidates = [c for c in merged_candidates if c['detection_count'] >= 2]
     
-    # === METHOD 2: HSV-based detection (STRICTER) ===
+    # === ADDITIONAL HSV-BASED DETECTION ===
+    # Catch colonies that multi-threshold might miss
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
@@ -306,89 +383,76 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     bg_v = np.median(plate_v)
     bg_s = np.median(plate_s)
     
-    # Thresholds closer to v1.6.1 (which worked better)
-    is_bright_hsv = v > (bg_v + 12)  # Same as v1.6.1
-    is_less_saturated = s < (bg_s * 0.82)  # Same as v1.6.1
-    method2_mask = is_bright_hsv & is_less_saturated & plate_mask
-    method2_weight = 1.0
+    # HSV detection mask
+    hsv_mask = (v > bg_v + 10) & (s < bg_s * 0.85) & plate_mask
+    hsv_mask = ndimage.binary_opening(hsv_mask, iterations=1)
     
-    # === METHOD 3: Local maxima detection (STRICTER) ===
-    blurred = gaussian_filter(enhanced, sigma=1.2)
-    local_max = maximum_filter(blurred, size=7)  # Increased from 5
+    # === CREATE COMBINED BINARY MASK ===
+    combined_mask = np.zeros_like(plate_mask, dtype=bool)
     
-    # Higher threshold
-    peaks = (blurred == local_max) & (enhanced > bg_enhanced + 0.6 * std_enhanced) & plate_mask
-    method3_mask = ndimage.binary_dilation(peaks, iterations=2)
-    method3_weight = 0.8
+    # Add reliable multi-threshold candidates
+    for cand in reliable_candidates:
+        # Use the largest mask from this candidate
+        if cand['masks']:
+            largest_mask = max(cand['masks'], key=lambda m: np.sum(m))
+            combined_mask |= largest_mask
     
-    # === METHOD 4: Direct intensity threshold - closer to v1.6.1 ===
-    intensity_thresh = bg_enhanced + 0.85 * std_enhanced  # Between 0.8 (v1.6.1) and 0.9
-    method4_mask = (enhanced > intensity_thresh) & plate_mask
-    method4_weight = 0.7
-    
-    # === WEIGHTED VOTING - 47% threshold (closer to v1.6.1's 45%) ===
-    weighted_score = (
-        method1_mask.astype(float) * method1_weight +
-        method2_mask.astype(float) * method2_weight +
-        method3_mask.astype(float) * method3_weight +
-        method4_mask.astype(float) * method4_weight
-    )
-    
-    total_weight = method1_weight + method2_weight + method3_weight + method4_weight
-    
-    # Require 47% weighted agreement (closer to v1.6.1's 45%)
-    combined_mask = (weighted_score >= total_weight * 0.47) & plate_mask
-    
-    # === MORPHOLOGICAL CLEANUP ===
-    combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
-    combined_mask = ndimage.binary_closing(combined_mask, iterations=1)
-    combined_mask = ndimage.binary_fill_holes(combined_mask)
+    # Add HSV detections that overlap with at least some multi-threshold detection
+    # This helps catch colonies that were detected at only 1 threshold
+    for cand in merged_candidates:
+        if cand['detection_count'] == 1:
+            # Check if HSV also detected this region
+            if cand['masks']:
+                cand_mask = cand['masks'][0]
+                overlap = np.sum(cand_mask & hsv_mask)
+                if overlap > np.sum(cand_mask) * 0.3:  # 30% overlap with HSV
+                    combined_mask |= cand_mask
     
     # === WATERSHED SEGMENTATION ===
-    segmented, num_segments = improved_watershed_segmentation(combined_mask, enhanced)
+    segmented, num_segments = watershed_separation(combined_mask, enhanced)
     
-    # === FILTER BY SIZE AND CIRCULARITY (STRICTER) ===
-    if isinstance(segmented, np.ndarray) and segmented.max() > 0:
-        labeled = segmented
-        num_features = int(segmented.max())
-    else:
-        labeled, num_features = label(combined_mask)
-    
+    # === VALIDATE EACH COLONY ===
     valid_colonies = 0
     colony_sizes = []
     colony_circularities = []
+    colony_intensities = []
     
-    min_size = MIN_COLONY_SIZE      # 10 pixels (increased)
-    max_size = MAX_COLONY_SIZE      # 5000 pixels
-    min_circ = MIN_CIRCULARITY      # 0.25 (restored)
-    
-    for i in range(1, num_features + 1):
-        component = labeled == i
-        size = np.sum(component)
+    for i in range(1, num_segments + 1):
+        component = segmented == i
+        area = np.sum(component)
         
-        if min_size <= size <= max_size:
+        if MIN_COLONY_SIZE <= area <= MAX_COLONY_SIZE:
             circ = calculate_circularity(component)
+            mean_intensity = np.mean(enhanced[component])
             
-            if circ >= min_circ:
+            # Intensity validation: colony should be brighter than background
+            intensity_ok = mean_intensity > bg_mean + 0.3 * bg_std
+            
+            # Circularity check
+            circ_ok = circ >= MIN_CIRCULARITY
+            
+            if intensity_ok and circ_ok:
                 valid_colonies += 1
-                colony_sizes.append(size)
+                colony_sizes.append(area)
                 colony_circularities.append(circ)
+                colony_intensities.append(mean_intensity)
     
     avg_size = np.mean(colony_sizes) if colony_sizes else 0
     avg_circ = np.mean(colony_circularities) if colony_circularities else 0
     
     debug_info = {
-        'method1_detections': int(np.sum(method1_mask)),
-        'method2_detections': int(np.sum(method2_mask)),
-        'method3_detections': int(np.sum(method3_mask)),
-        'method4_detections': int(np.sum(method4_mask)),
-        'combined_pixels': int(np.sum(combined_mask)),
-        'segments_before_filter': num_features,
-        'bg_enhanced': round(float(bg_enhanced), 1),
-        'std_enhanced': round(float(std_enhanced), 1)
+        'total_candidates': len(candidates),
+        'merged_candidates': len(merged_candidates),
+        'reliable_candidates': len(reliable_candidates),
+        'num_thresholds': len(thresholds),
+        'threshold_range': f"{thresholds[0]:.1f}-{thresholds[-1]:.1f}",
+        'segments_before_filter': num_segments,
+        'bg_mean': round(float(bg_mean), 1),
+        'bg_std': round(float(bg_std), 1),
+        'avg_colony_intensity': round(float(np.mean(colony_intensities)), 1) if colony_intensities else 0
     }
     
-    return valid_colonies, avg_size, avg_circ, labeled, debug_info
+    return valid_colonies, avg_size, avg_circ, segmented, debug_info
 
 
 def detect_hemolysis_hsv(rgb_array, plate_mask):
@@ -408,7 +472,7 @@ def detect_hemolysis_hsv(rgb_array, plate_mask):
     is_desaturated = s < (bg_s * 0.80)
     beta_zones = (is_bright | is_desaturated) & plate_mask
     
-    from scipy.ndimage import binary_erosion, binary_dilation
+    from scipy.ndimage import binary_dilation
     
     very_bright = v > (bg_v + 25)
     colony_cores = very_bright & plate_mask
@@ -486,12 +550,12 @@ def generate_decision(colony_count, hemolysis, media_type):
 
 
 def analyze_plate(image_bytes, media_type='blood_agar'):
-    """Main analysis function - v1.6.1"""
+    """Main analysis function - v1.7.0"""
     img = load_and_resize_image(image_bytes)
     plate_mask, center, radius = create_plate_mask(img.shape, rgb_array=img)
     luminance = get_luminance(img)
     
-    colony_count, avg_size, avg_circ, labeled, debug_info = colony_detection_v161(
+    colony_count, avg_size, avg_circ, labeled, debug_info = colony_detection_v170(
         img, luminance, plate_mask
     )
     
@@ -516,7 +580,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
         'debug': debug_info,
-        'version': '1.6.4-tuned'
+        'version': '1.7.0-opencfu-style'
     }
 
 
@@ -525,32 +589,29 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.6.4-tuned',
+        'version': '1.7.0-opencfu-style',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'algorithms': [
-            'CLAHE preprocessing (clip=2.0)',
-            'Noise reduction (median filter)',
-            'Adaptive thresholding (C=9,13,17)',
-            'HSV color space analysis',
-            'Local maxima detection',
-            'Improved watershed segmentation',
-            'Weighted voting (47% threshold)',
-            'Circularity filtering (0.25)'
+            'CLAHE preprocessing',
+            'OpenCFU-style multi-thresholding (10 levels)',
+            'Cross-threshold candidate merging',
+            'Detection count filtering (2+ thresholds)',
+            'HSV color validation',
+            'Watershed segmentation',
+            'Per-colony intensity validation',
+            'Circularity filtering'
         ],
-        'tuning': 'v1.6.4 - closer to v1.6.1 parameters'
+        'based_on': 'OpenCFU (PLOS ONE 2013), CFUCounter'
     })
 
 
 @app.route('/warmup', methods=['GET'])
 def warmup():
-    """
-    Warm-up endpoint - call this before /analyze to wake up the service
-    Returns immediately with minimal processing
-    """
+    """Warm-up endpoint"""
     return jsonify({
         'status': 'warm',
-        'version': '1.6.4-tuned',
+        'version': '1.7.0-opencfu-style',
         'message': 'Service is ready for analysis'
     })
 
