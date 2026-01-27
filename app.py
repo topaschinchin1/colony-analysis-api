@@ -236,19 +236,6 @@ def detect_hemolysis_calibrated(rgb_array, luminance, plate_mask):
     }
 
 
-def create_plate_mask(shape):
-    """Create circular plate mask - EXPANDED to catch edge colonies"""
-    h, w = shape[:2]
-    center_y, center_x = h // 2, w // 2
-    radius = min(h, w) // 2 - 3  # Was -5, now -3
-    
-    y, x = np.ogrid[:h, :w]
-    dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    mask = dist <= radius * 0.95  # Was 0.92, now 0.95 - include more edge area
-    
-    return mask, (center_x, center_y), radius
-
-
 def generate_decision(colony_count, hemolysis, media_type):
     """Generate decision label"""
     if colony_count <= 3:
