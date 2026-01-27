@@ -1,7 +1,7 @@
 """
 Colony Counting and Hemolysis Detection API
-Aggressive detection version
-Version: 1.4.0
+Maximum sensitivity version
+Version: 1.5.0
 """
 
 import os
@@ -14,8 +14,8 @@ from PIL import Image
 
 app = Flask(__name__)
 
-# Configuration - AGGRESSIVE DETECTION
-MAX_IMAGE_SIZE = 800  # Larger for better small colony detection
+# Configuration - MAXIMUM SENSITIVITY
+MAX_IMAGE_SIZE = 900  # Even larger for tiny colony detection
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
 
 
@@ -43,7 +43,7 @@ def get_luminance(rgb_array):
 
 
 def enhanced_colony_detection(rgb_array, luminance, plate_mask):
-    """AGGRESSIVE colony detection - tuned for ~189 CFU plate"""
+    """MAXIMUM SENSITIVITY colony detection - target ~189 CFU"""
     from scipy import ndimage
     from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
     
@@ -52,55 +52,54 @@ def enhanced_colony_detection(rgb_array, luminance, plate_mask):
     background = np.median(plate_pixels)
     std_dev = np.std(plate_pixels)
     
-    # Method 1: Luminance-based - MORE SENSITIVE
-    bright_threshold = background + (0.8 * std_dev)  # Was 1.2, now 0.8
+    # Method 1: Luminance-based - VERY SENSITIVE
+    bright_threshold = background + (0.6 * std_dev)  # Was 0.8, now 0.6
     bright_colonies = (luminance > bright_threshold) & plate_mask
     
-    # Method 2: Detect whitish colonies specifically
+    # Method 2: Detect whitish colonies
     r, g, b = rgb_array[:,:,0], rgb_array[:,:,1], rgb_array[:,:,2]
-    
-    # White/light colonies: high overall brightness
     brightness = (r.astype(float) + g.astype(float) + b.astype(float)) / 3
     plate_brightness = brightness[plate_mask]
     bright_median = np.median(plate_brightness)
     
-    # Lower threshold for white detection
-    is_bright = brightness > (bright_median + 12)  # Was +20, now +12
+    # Even lower threshold
+    is_bright = brightness > (bright_median + 8)  # Was +12, now +8
     
-    # Not too red (blood agar background is red)
+    # Not too red
     red_ratio = r.astype(float) / (brightness + 1)
-    not_too_red = red_ratio < 1.25  # Was 1.3, now 1.25
+    not_too_red = red_ratio < 1.2  # Was 1.25, now 1.2
     
     white_colonies = is_bright & not_too_red & plate_mask
     
-    # Method 3: Local maxima - find ALL bright spots
-    blurred = gaussian_filter(luminance.astype(float), sigma=1.5)  # Was 2, now 1.5
-    local_max = maximum_filter(blurred, size=5)  # Was 7, now 5 (finer)
-    peaks = (blurred == local_max) & (luminance > background + std_dev * 0.5) & plate_mask  # Was 0.8, now 0.5
+    # Method 3: Local maxima - FINEST detection
+    blurred = gaussian_filter(luminance.astype(float), sigma=1.0)  # Was 1.5, now 1.0
+    local_max = maximum_filter(blurred, size=4)  # Was 5, now 4
+    peaks = (blurred == local_max) & (luminance > background + std_dev * 0.3) & plate_mask  # Was 0.5, now 0.3
     
-    # Dilate peaks
-    dilated_peaks = ndimage.binary_dilation(peaks, iterations=2)
+    # Dilate peaks slightly
+    dilated_peaks = ndimage.binary_dilation(peaks, iterations=1)  # Was 2, now 1
     
-    # Method 4: Edge-based detection for colonies with halos
-    # Colonies often have bright centers with surrounding zones
-    local_min = minimum_filter(blurred, size=9)
+    # Method 4: Edge-based detection
+    local_min = minimum_filter(blurred, size=7)  # Was 9, now 7
     contrast = blurred - local_min
-    high_contrast = (contrast > std_dev * 0.4) & plate_mask
+    high_contrast = (contrast > std_dev * 0.3) & plate_mask  # Was 0.4, now 0.3
+    
+    # Method 5: Adaptive threshold - catch colonies missed by global threshold
+    # Use local mean comparison
+    local_mean = ndimage.uniform_filter(luminance.astype(float), size=15)
+    above_local = (luminance > local_mean + 5) & plate_mask
     
     # Combine ALL methods
-    combined_mask = bright_colonies | white_colonies | dilated_peaks | high_contrast
-    
-    # Minimal cleanup - don't lose small colonies
-    # Skip binary_opening to preserve tiny colonies
+    combined_mask = bright_colonies | white_colonies | dilated_peaks | high_contrast | above_local
     
     # Label connected components
     labeled, num_features = ndimage.label(combined_mask)
     
-    # Filter by size - VERY SMALL minimum
+    # Filter by size - MINIMUM threshold
     valid_colonies = 0
     colony_sizes = []
-    min_size = 3   # Was 4, now 3 - catch tiny colonies
-    max_size = 4000
+    min_size = 2   # Was 3, now 2 - catch even tinier colonies
+    max_size = 5000
     
     for i in range(1, num_features + 1):
         size = np.sum(labeled == i)
@@ -185,14 +184,14 @@ def detect_hemolysis_calibrated(rgb_array, luminance, plate_mask):
 
 
 def create_plate_mask(shape):
-    """Create circular plate mask"""
+    """Create circular plate mask - EXPANDED to catch edge colonies"""
     h, w = shape[:2]
     center_y, center_x = h // 2, w // 2
-    radius = min(h, w) // 2 - 5
+    radius = min(h, w) // 2 - 3  # Was -5, now -3
     
     y, x = np.ogrid[:h, :w]
     dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    mask = dist <= radius * 0.92
+    mask = dist <= radius * 0.95  # Was 0.92, now 0.95 - include more edge area
     
     return mask, (center_x, center_y), radius
 
@@ -257,7 +256,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'radius_px': radius,
             'analyzed_size': list(img.shape[:2])
         },
-        'version': '1.4.0-aggressive'
+        'version': '1.5.0-maximum'
     }
 
 
@@ -266,10 +265,10 @@ def health():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.4.0-aggressive',
+        'version': '1.5.0-maximum',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
-        'calibration': 'Aggressive detection - tuned for 189 CFU reference plate'
+        'calibration': 'Maximum sensitivity - tuned for 189 CFU reference plate'
     })
 
 
