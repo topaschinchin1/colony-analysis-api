@@ -1,14 +1,14 @@
 """
 Colony Counting and Hemolysis Detection API
-Version: 1.6.1 - Tuned sensitivity + warm-up endpoint
+Version: 1.6.2 - Further tuned to reduce overcounting
 
-CHANGES FROM v1.6.0:
-- Added /warmup endpoint for pre-flight health check
-- Increased weighted voting threshold (35% → 45%)
-- Raised adaptive threshold C values
-- Increased minimum colony size (6 → 10)
-- Restored circularity threshold (0.20 → 0.25)
-- Reduced CLAHE clip limit (2.5 → 2.0)
+CHANGES FROM v1.6.1:
+- Increased weighted voting threshold (45% → 55%)
+- Higher adaptive threshold C values (8,12,16 → 12,16,20)
+- Increased minimum colony size (10 → 12)
+- Stricter circularity (0.25 → 0.28)
+- Stricter HSV brightness (+12 → +15)
+- Higher intensity threshold (0.8 → 1.0 std)
 
 Based on:
 - CFUCounter: r=0.999 correlation with manual counts
@@ -31,9 +31,9 @@ MAX_IMAGE_SIZE = 800
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
 
 # Colony detection parameters (tuned to reduce overcounting)
-MIN_COLONY_SIZE = 10      # pixels - increased from 6 to filter noise
+MIN_COLONY_SIZE = 12      # pixels - increased from 10
 MAX_COLONY_SIZE = 5000    # pixels - filter large artifacts
-MIN_CIRCULARITY = 0.25    # restored from 0.20
+MIN_CIRCULARITY = 0.28    # increased from 0.25
 BRIGHTNESS_THRESHOLD = 0.8
 
 
@@ -291,12 +291,12 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     
     # Higher C values = less sensitive
     for block_size in [41, 61, 81]:
-        for C_val in [8, 12, 16]:
+        for C_val in [12, 16, 20]:
             adaptive_mask = adaptive_threshold(enhanced, block_size=block_size, C=C_val)
             adaptive_mask = adaptive_mask & plate_mask
             adaptive_detections += adaptive_mask.astype(float) / 9
     
-    method1_mask = (adaptive_detections >= 0.4) & plate_mask  # Raised from 0.3
+    method1_mask = (adaptive_detections >= 0.45) & plate_mask  # Raised from 0.4
     method1_weight = 1.2
     
     # === METHOD 2: HSV-based detection (STRICTER) ===
@@ -309,8 +309,8 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     bg_s = np.median(plate_s)
     
     # Stricter thresholds
-    is_bright_hsv = v > (bg_v + 12)  # Raised from 8
-    is_less_saturated = s < (bg_s * 0.82)  # Lowered from 0.88
+    is_bright_hsv = v > (bg_v + 15)  # Raised from 12
+    is_less_saturated = s < (bg_s * 0.80)  # Lowered from 0.82
     method2_mask = is_bright_hsv & is_less_saturated & plate_mask
     method2_weight = 1.0
     
@@ -324,11 +324,11 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     method3_weight = 0.8
     
     # === METHOD 4: Direct intensity threshold (STRICTER) ===
-    intensity_thresh = bg_enhanced + 0.8 * std_enhanced  # Raised from 0.6
+    intensity_thresh = bg_enhanced + 1.0 * std_enhanced  # Raised from 0.8
     method4_mask = (enhanced > intensity_thresh) & plate_mask
     method4_weight = 0.7
     
-    # === WEIGHTED VOTING (STRICTER - 45% threshold) ===
+    # === WEIGHTED VOTING (STRICTER - 55% threshold) ===
     weighted_score = (
         method1_mask.astype(float) * method1_weight +
         method2_mask.astype(float) * method2_weight +
@@ -338,8 +338,8 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     
     total_weight = method1_weight + method2_weight + method3_weight + method4_weight
     
-    # Require 45% weighted agreement (raised from 35%)
-    combined_mask = (weighted_score >= total_weight * 0.45) & plate_mask
+    # Require 55% weighted agreement (raised from 45%)
+    combined_mask = (weighted_score >= total_weight * 0.55) & plate_mask
     
     # === MORPHOLOGICAL CLEANUP ===
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
@@ -518,7 +518,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
         'debug': debug_info,
-        'version': '1.6.1-tuned-sensitivity'
+        'version': '1.6.2-stricter-thresholds'
     }
 
 
@@ -527,20 +527,20 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.6.1-tuned-sensitivity',
+        'version': '1.6.2-stricter-thresholds',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'algorithms': [
             'CLAHE preprocessing (clip=2.0)',
             'Noise reduction (median filter)',
-            'Adaptive thresholding (C=8,12,16)',
+            'Adaptive thresholding (C=12,16,20)',
             'HSV color space analysis',
             'Local maxima detection',
             'Improved watershed segmentation',
-            'Weighted voting (45% threshold)',
-            'Circularity filtering (0.25)'
+            'Weighted voting (55% threshold)',
+            'Circularity filtering (0.28)'
         ],
-        'tuning': 'Reduced sensitivity to prevent overcounting'
+        'tuning': 'Stricter thresholds to prevent overcounting v1.6.2'
     })
 
 
@@ -552,7 +552,7 @@ def warmup():
     """
     return jsonify({
         'status': 'warm',
-        'version': '1.6.1-tuned-sensitivity',
+        'version': '1.6.2-stricter-thresholds',
         'message': 'Service is ready for analysis'
     })
 
