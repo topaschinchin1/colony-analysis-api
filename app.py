@@ -86,56 +86,51 @@ def get_luminance(rgb_array):
 
 def detect_plate_region(rgb_array):
     """
-    Detect blood agar plate - v1.5.8 simplified
-    Focus on HIGH SATURATION to differentiate from skin/background
+    Detect blood agar plate using HSV color space
+    Blood agar: Hue ~0-30 (red), high saturation
+    RESTORED from v1.5.3 (which had 94% accuracy on GAS-03)
     """
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
-    # Blood agar: Red hue + HIGH saturation (this is the key!)
-    # Saturation > 80 eliminates most skin tones and backgrounds
-    is_red_agar = (
-        ((h <= 40) | (h >= 315)) &  # Red-orange hue
-        (s > 80) &                   # HIGH saturation (blood agar is vivid)
-        (v > 35) & (v < 240)         # Reasonable brightness
-    )
+    # Blood agar is RED (hue 0-30 or 330-360)
+    is_red = ((h <= 30) | (h >= 330)) & (s > 50) & (v > 40) & (v < 240)
+    
+    # Also accept orange-red range (0-45) - v1.5.3 original
+    is_red_expanded = ((h <= 45) | (h >= 315)) & (s > 40) & (v > 30) & (v < 250)
     
     from scipy import ndimage
     
-    # Clean up
-    agar_mask = ndimage.binary_closing(is_red_agar, iterations=6)
-    agar_mask = ndimage.binary_opening(agar_mask, iterations=3)
+    # Use expanded detection, clean up
+    agar_mask = ndimage.binary_closing(is_red_expanded, iterations=8)
+    agar_mask = ndimage.binary_opening(agar_mask, iterations=4)
     agar_mask = ndimage.binary_fill_holes(agar_mask)
     
     return agar_mask
 
 
 def create_plate_mask(shape, rgb_array=None):
-    """
-    Create plate mask - v1.5.8 simple and reliable
-    """
+    """Create plate mask combining circular and color detection - v1.5.3 original"""
     h, w = shape[:2]
     center_y, center_x = h // 2, w // 2
     radius = min(h, w) // 2 - 5
     
-    # Circular mask - moderate size
+    # Basic circular mask (fallback) - v1.5.3 used 0.88
     y, x = np.ogrid[:h, :w]
     dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    circular_mask = dist <= radius * 0.90
+    circular_mask = dist <= radius * 0.88  # Conservative
     
     if rgb_array is not None:
         color_mask = detect_plate_region(rgb_array)
         
-        # Combine: color within circle
+        # Combine: use color mask but only within reasonable bounds
         combined = circular_mask & color_mask
         
-        # If color detection found reasonable area, use it
-        if np.sum(combined) > np.sum(circular_mask) * 0.20:
+        # If color detection got enough area, use it (v1.5.3 used 0.25)
+        if np.sum(combined) > np.sum(circular_mask) * 0.25:
             return combined, (center_x, center_y), radius
     
-    # Fallback - smaller circle
-    circular_mask_small = dist <= radius * 0.85
-    return circular_mask_small, (center_x, center_y), radius
+    return circular_mask, (center_x, center_y), radius
 
 
 def watershed_colony_segmentation(binary_mask, luminance):
@@ -258,11 +253,10 @@ def iterative_threshold_detection(luminance, plate_mask, rgb_array):
     return combined
 
 
-def colony_detection_v158(rgb_array, luminance, plate_mask):
+def colony_detection_v159(rgb_array, luminance, plate_mask):
     """
-    Version 1.5.8 colony detection - Return to strict settings
-    Based on v1.5.3 which had 94% accuracy on GAS-03
-    With slight sensitivity increase for GAS-01
+    Version 1.5.9 colony detection - EXACT v1.5.3 parameters restored
+    v1.5.3 had 94% accuracy on GAS-03, 50% on GAS-01
     """
     from scipy import ndimage
     from scipy.ndimage import gaussian_filter, maximum_filter, label
@@ -270,7 +264,7 @@ def colony_detection_v158(rgb_array, luminance, plate_mask):
     # === METHOD 1: Iterative thresholding ===
     iterative_mask = iterative_threshold_detection(luminance, plate_mask, rgb_array)
     
-    # === METHOD 2: HSV-based detection ===
+    # === METHOD 2: HSV-based detection - EXACT v1.5.3 ===
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
@@ -279,41 +273,41 @@ def colony_detection_v158(rgb_array, luminance, plate_mask):
     bg_v = np.median(plate_v)
     bg_s = np.median(plate_s)
     
-    # Strict HSV criteria (v1.5.3 style but slightly relaxed)
-    is_bright_hsv = v > (bg_v + 8)  # v1.5.3 was +10
-    is_less_saturated = s < (bg_s * 0.87)  # v1.5.3 was 0.85
+    # v1.5.3 exact: brightness +10, saturation 0.85
+    is_bright_hsv = v > (bg_v + 10)
+    is_less_saturated = s < (bg_s * 0.85)
     hsv_colonies = is_bright_hsv & is_less_saturated & plate_mask
     
-    # === METHOD 3: Local maxima detection ===
-    blurred = gaussian_filter(luminance.astype(float), sigma=1.1)  # v1.5.3 was 1.2
+    # === METHOD 3: Local maxima detection - EXACT v1.5.3 ===
+    blurred = gaussian_filter(luminance.astype(float), sigma=1.2)  # v1.5.3 exact
     local_max = maximum_filter(blurred, size=5)
     
     plate_lum = luminance[plate_mask]
     bg_lum = np.median(plate_lum)
     std_lum = np.std(plate_lum)
     
-    # Strict peak detection
-    peaks = (blurred == local_max) & (luminance > bg_lum + 0.45 * std_lum) & plate_mask
+    # v1.5.3 exact: 0.5 std
+    peaks = (blurred == local_max) & (luminance > bg_lum + 0.5 * std_lum) & plate_mask
     peaks_dilated = ndimage.binary_dilation(peaks, iterations=2)
     
-    # === COMBINE METHODS - STRICT (require 2+ methods) ===
+    # === COMBINE METHODS - v1.5.3 exact ===
     method_agreement = (
         iterative_mask.astype(int) + 
         hsv_colonies.astype(int) + 
         peaks_dilated.astype(int)
     )
     
-    # Strict: require 2+ methods to agree (v1.5.3 approach)
+    # v1.5.3 exact: require 2+ methods
     combined_mask = (method_agreement >= 2) & plate_mask
     
-    # Cleanup
+    # Light cleanup - v1.5.3 exact
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
     combined_mask = ndimage.binary_closing(combined_mask, iterations=1)
     
     # === WATERSHED SEGMENTATION ===
     segmented, num_segments = watershed_colony_segmentation(combined_mask, luminance)
     
-    # === FILTER BY SIZE AND CIRCULARITY ===
+    # === FILTER BY SIZE AND CIRCULARITY - v1.5.3 exact ===
     if isinstance(segmented, np.ndarray) and segmented.max() > 0:
         labeled = segmented
         num_features = int(segmented.max())
@@ -324,10 +318,10 @@ def colony_detection_v158(rgb_array, luminance, plate_mask):
     colony_sizes = []
     colony_circularities = []
     
-    # Strict filters (v1.5.3 style)
-    min_size = 7
-    max_size = 5500
-    min_circ = 0.22
+    # v1.5.3 exact filters
+    min_size = 8       # MIN_COLONY_SIZE
+    max_size = 5000    # MAX_COLONY_SIZE
+    min_circ = 0.25    # MIN_CIRCULARITY
     
     for i in range(1, num_features + 1):
         component = labeled == i
@@ -459,16 +453,16 @@ def generate_decision(colony_count, hemolysis, media_type):
 
 
 def analyze_plate(image_bytes, media_type='blood_agar'):
-    """Main analysis function - v1.5.8"""
+    """Main analysis function - v1.5.9 (exact v1.5.3 restoration)"""
     img = load_and_resize_image(image_bytes)
     
-    # Create plate mask with high-saturation color detection
+    # Create plate mask - v1.5.3 exact
     plate_mask, center, radius = create_plate_mask(img.shape, rgb_array=img)
     
     luminance = get_luminance(img)
     
-    # Colony detection - strict settings
-    colony_count, avg_size, avg_circ, labeled = colony_detection_v158(
+    # Colony detection - v1.5.3 exact parameters
+    colony_count, avg_size, avg_circ, labeled = colony_detection_v159(
         img, luminance, plate_mask
     )
     
@@ -495,7 +489,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'analyzed_size': list(img.shape[:2]),
             'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
-        'version': '1.5.8-strict'
+        'version': '1.5.9-v153-restored'
     }
     }
 
@@ -505,16 +499,16 @@ def health():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.5.8-strict',
+        'version': '1.5.9-v153-restored',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'algorithms': [
-            'High-saturation agar detection (s>80)',
-            'Strict 3-method voting (require 2+)',
-            'HSV colony detection',
-            'Iterative thresholding',
-            'Watershed segmentation'
-        ]
+            'HSV color space analysis',
+            'Iterative adaptive thresholding', 
+            'Watershed segmentation',
+            'Circularity filtering'
+        ],
+        'note': 'Exact v1.5.3 parameters restored (94% on GAS-03)'
     })
 
 
