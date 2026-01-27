@@ -1,10 +1,10 @@
 """
 Colony Counting and Hemolysis Detection API
-Version: 1.6.5 - Fine-tuned voting threshold
+Version: 1.6.6 - Fixed watershed over-segmentation
 
-TARGET: 189 CFU for GAS-01
-- v1.6.4: 249 (47% threshold) - 32% over
-- v1.6.5: 51% threshold - targeting ~190
+FIX: Removed intensity peaks from watershed markers
+- Intensity peaks were causing over-segmentation
+- Now using only distance transform peaks
 
 Based on:
 - CFUCounter: r=0.999 correlation with manual counts
@@ -185,7 +185,7 @@ def create_plate_mask(shape, rgb_array=None):
 
 
 def improved_watershed_segmentation(binary_mask, intensity_image):
-    """Improved watershed segmentation using peak_local_max"""
+    """Simplified watershed - distance transform only, no intensity peaks"""
     from scipy import ndimage
     from scipy.ndimage import distance_transform_edt, label, maximum_filter
     
@@ -193,25 +193,24 @@ def improved_watershed_segmentation(binary_mask, intensity_image):
         return np.zeros_like(binary_mask, dtype=int), 0
     
     distance = distance_transform_edt(binary_mask)
-    footprint_size = 9  # Increased from 7 for less fragmentation
+    footprint_size = 11  # Larger footprint = fewer peaks = less over-segmentation
     local_max = maximum_filter(distance, size=footprint_size)
     
-    # Higher threshold for peak detection
-    distance_threshold = max(3, np.percentile(distance[binary_mask], 40))
+    # Higher threshold for peak detection - only clear colony centers
+    distance_threshold = max(4, np.percentile(distance[binary_mask], 50))
     peaks = (distance == local_max) & (distance >= distance_threshold) & binary_mask
     
-    if intensity_image is not None:
-        intensity_masked = np.where(binary_mask, intensity_image, 0)
-        intensity_local_max = maximum_filter(intensity_masked, size=7)
-        intensity_peaks = (intensity_masked == intensity_local_max) & binary_mask
-        peaks = peaks | (intensity_peaks & (distance > 2))
+    # NO intensity peaks - they cause over-segmentation
+    # peaks = peaks | (intensity_peaks & (distance > 2))  # REMOVED
     
     markers, num_markers = label(peaks)
     
     if num_markers == 0:
+        # No clear peaks found - just use connected components
         labeled, num_features = label(binary_mask)
         return labeled, num_features
     
+    # Region growing from markers
     segmented = np.zeros_like(binary_mask, dtype=int)
     segmented[markers > 0] = markers[markers > 0]
     
@@ -324,7 +323,7 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     method4_mask = (enhanced > intensity_thresh) & plate_mask
     method4_weight = 0.7
     
-    # === WEIGHTED VOTING - 51% threshold ===
+    # === WEIGHTED VOTING - 47% threshold (closer to v1.6.1's 45%) ===
     weighted_score = (
         method1_mask.astype(float) * method1_weight +
         method2_mask.astype(float) * method2_weight +
@@ -334,8 +333,8 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     
     total_weight = method1_weight + method2_weight + method3_weight + method4_weight
     
-    # Require 51% weighted agreement
-    combined_mask = (weighted_score >= total_weight * 0.51) & plate_mask
+    # Require 47% weighted agreement (closer to v1.6.1's 45%)
+    combined_mask = (weighted_score >= total_weight * 0.47) & plate_mask
     
     # === MORPHOLOGICAL CLEANUP ===
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
@@ -514,7 +513,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
         'debug': debug_info,
-        'version': '1.6.5-fine-tuned'
+        'version': '1.6.6-watershed-fix'
     }
 
 
@@ -523,7 +522,7 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.6.5-fine-tuned',
+        'version': '1.6.6-watershed-fix',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'algorithms': [
@@ -533,10 +532,10 @@ def health():
             'HSV color space analysis',
             'Local maxima detection',
             'Improved watershed segmentation',
-            'Weighted voting (51% threshold)',
+            'Weighted voting (47% threshold)',
             'Circularity filtering (0.25)'
         ],
-        'tuning': 'v1.6.5 - 51% voting threshold targeting 189 CFU'
+        'tuning': 'v1.6.4 - closer to v1.6.1 parameters'
     })
 
 
@@ -548,7 +547,7 @@ def warmup():
     """
     return jsonify({
         'status': 'warm',
-        'version': '1.6.5-fine-tuned',
+        'version': '1.6.6-watershed-fix',
         'message': 'Service is ready for analysis'
     })
 
