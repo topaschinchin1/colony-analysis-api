@@ -252,18 +252,18 @@ def iterative_threshold_detection(luminance, plate_mask, rgb_array):
     return combined
 
 
-def colony_detection_v154(rgb_array, luminance, plate_mask):
+def colony_detection_v155(rgb_array, luminance, plate_mask):
     """
-    Version 1.5.4 colony detection - balanced for both plate types
-    Fixes: v1.5.3 was too strict, missing darker colonies
+    Version 1.5.5 colony detection - fine-tuned for 80%+ accuracy
+    Target: GAS-01 (189) and GAS-03 (108) both at ~80%
     """
     from scipy import ndimage
     from scipy.ndimage import gaussian_filter, maximum_filter, label
     
-    # === METHOD 1: Iterative thresholding (more sensitive) ===
+    # === METHOD 1: Iterative thresholding ===
     iterative_mask = iterative_threshold_detection(luminance, plate_mask, rgb_array)
     
-    # === METHOD 2: HSV-based detection (relaxed thresholds) ===
+    # === METHOD 2: HSV-based detection ===
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
@@ -272,40 +272,48 @@ def colony_detection_v154(rgb_array, luminance, plate_mask):
     bg_v = np.median(plate_v)
     bg_s = np.median(plate_s)
     
-    # RELAXED: Lower brightness threshold to catch darker colonies
-    is_bright_hsv = v > (bg_v + 5)  # Was +10, now +5
-    is_less_saturated = s < (bg_s * 0.90)  # Was 0.85, now 0.90 (less strict)
+    # MORE SENSITIVE: Catch lighter colonies
+    is_bright_hsv = v > (bg_v + 3)  # Was +5, now +3
+    is_less_saturated = s < (bg_s * 0.92)  # Was 0.90, now 0.92
     hsv_colonies = is_bright_hsv & is_less_saturated & plate_mask
     
-    # === METHOD 3: Local maxima detection (more sensitive) ===
-    blurred = gaussian_filter(luminance.astype(float), sigma=1.0)  # Was 1.2
-    local_max = maximum_filter(blurred, size=5)
+    # === METHOD 3: Local maxima detection ===
+    blurred = gaussian_filter(luminance.astype(float), sigma=0.8)  # Was 1.0, tighter
+    local_max = maximum_filter(blurred, size=4)  # Was 5, smaller window
     
     plate_lum = luminance[plate_mask]
     bg_lum = np.median(plate_lum)
     std_lum = np.std(plate_lum)
     
-    # RELAXED: Lower threshold
-    peaks = (blurred == local_max) & (luminance > bg_lum + 0.4 * std_lum) & plate_mask  # Was 0.5
+    # MORE SENSITIVE threshold
+    peaks = (blurred == local_max) & (luminance > bg_lum + 0.3 * std_lum) & plate_mask  # Was 0.4
     peaks_dilated = ndimage.binary_dilation(peaks, iterations=2)
     
-    # === METHOD 4: Direct luminance threshold (new - catches what others miss) ===
-    bright_direct = luminance > (bg_lum + 0.7 * std_lum)  # Simple brightness check
+    # === METHOD 4: Direct luminance threshold ===
+    bright_direct = luminance > (bg_lum + 0.5 * std_lum)  # Was 0.7
     bright_direct = bright_direct & plate_mask
     
+    # === METHOD 5: Edge/contrast detection (NEW) ===
+    # Colonies have edges - detect local contrast
+    from scipy.ndimage import minimum_filter
+    local_min = minimum_filter(blurred, size=5)
+    local_contrast = blurred - local_min
+    high_contrast = local_contrast > (np.std(local_contrast[plate_mask]) * 0.5)
+    contrast_colonies = high_contrast & plate_mask
+    
     # === COMBINE METHODS ===
-    # Weight the methods and use lower threshold
     method_agreement = (
-        iterative_mask.astype(int) * 1.0 +  # Good general detection
-        hsv_colonies.astype(int) * 1.0 +     # Color-based
-        peaks_dilated.astype(int) * 0.8 +    # Peak detection
-        bright_direct.astype(int) * 0.5      # Fallback
+        iterative_mask.astype(int) * 1.0 +
+        hsv_colonies.astype(int) * 1.0 +
+        peaks_dilated.astype(int) * 0.8 +
+        bright_direct.astype(int) * 0.6 +
+        contrast_colonies.astype(int) * 0.6  # New edge detection
     )
     
-    # RELAXED: Accept if score >= 1.5 (was 2.0)
-    combined_mask = (method_agreement >= 1.5) & plate_mask
+    # MORE SENSITIVE: Accept if score >= 1.2 (was 1.5)
+    combined_mask = (method_agreement >= 1.2) & plate_mask
     
-    # Light cleanup (less aggressive)
+    # Light cleanup
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
     
     # === WATERSHED SEGMENTATION ===
@@ -322,10 +330,10 @@ def colony_detection_v154(rgb_array, luminance, plate_mask):
     colony_sizes = []
     colony_circularities = []
     
-    # RELAXED size constraints
-    min_size = 6  # Was 8
-    max_size = 6000  # Was 5000
-    min_circ = 0.20  # Was 0.25
+    # OPTIMIZED filters - slightly relaxed
+    min_size = 5  # Was 6
+    max_size = 8000  # Was 6000
+    min_circ = 0.15  # Was 0.20
     
     for i in range(1, num_features + 1):
         component = labeled == i
@@ -457,7 +465,7 @@ def generate_decision(colony_count, hemolysis, media_type):
 
 
 def analyze_plate(image_bytes, media_type='blood_agar'):
-    """Main analysis function - v1.5.4"""
+    """Main analysis function - v1.5.5"""
     img = load_and_resize_image(image_bytes)
     
     # Create plate mask with color detection
@@ -465,12 +473,12 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
     
     luminance = get_luminance(img)
     
-    # Colony detection with balanced algorithm
-    colony_count, avg_size, avg_circ, labeled = colony_detection_v154(
+    # Colony detection with fine-tuned algorithm
+    colony_count, avg_size, avg_circ, labeled = colony_detection_v155(
         img, luminance, plate_mask
     )
     
-    # Hemolysis detection with HSV (fixed)
+    # Hemolysis detection with HSV
     hemolysis = detect_hemolysis_hsv(img, plate_mask)
     
     # Generate decision
@@ -493,7 +501,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'analyzed_size': list(img.shape[:2]),
             'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
-        'version': '1.5.4-balanced'
+        'version': '1.5.5-tuned'
     }
 
 
@@ -502,16 +510,18 @@ def health():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.5.4-balanced',
+        'version': '1.5.5-tuned',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'algorithms': [
             'HSV color space analysis',
             'Iterative adaptive thresholding',
             'Watershed segmentation',
-            'Multi-method voting (relaxed)',
+            '5-method voting system',
+            'Edge/contrast detection',
             'Halo-based hemolysis detection'
-        ]
+        ],
+        'target_accuracy': '80%+'
     })
 
 
