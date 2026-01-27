@@ -84,6 +84,66 @@ def get_luminance(rgb_array):
     return 0.299 * rgb_array[:,:,0] + 0.587 * rgb_array[:,:,1] + 0.114 * rgb_array[:,:,2]
 
 
+def detect_circular_plate(rgb_array):
+    """
+    Detect petri dish using edge-based circle detection
+    This is more robust than color-only detection for messy backgrounds
+    """
+    from scipy import ndimage
+    from scipy.ndimage import sobel, gaussian_filter
+    
+    h, w = rgb_array.shape[:2]
+    luminance = get_luminance(rgb_array)
+    
+    # Smooth to reduce noise
+    smoothed = gaussian_filter(luminance, sigma=2)
+    
+    # Edge detection using Sobel
+    edge_x = sobel(smoothed, axis=1)
+    edge_y = sobel(smoothed, axis=0)
+    edge_magnitude = np.sqrt(edge_x**2 + edge_y**2)
+    
+    # Threshold edges
+    edge_thresh = np.percentile(edge_magnitude, 85)
+    edges = edge_magnitude > edge_thresh
+    
+    # Try multiple potential circle centers and radii
+    # Focus on center region of image
+    center_y, center_x = h // 2, w // 2
+    
+    best_score = 0
+    best_center = (center_x, center_y)
+    best_radius = min(h, w) // 2 - 10
+    
+    # Search around image center
+    for cy_offset in range(-h//8, h//8, h//16):
+        for cx_offset in range(-w//8, w//8, w//16):
+            cy = center_y + cy_offset
+            cx = center_x + cx_offset
+            
+            # Try different radii (30% to 48% of image size)
+            for r_pct in [0.30, 0.35, 0.40, 0.45]:
+                r = int(min(h, w) * r_pct)
+                
+                # Create circle perimeter mask
+                y, x = np.ogrid[:h, :w]
+                dist = np.sqrt((x - cx)**2 + (y - cy)**2)
+                
+                # Pixels on the circle edge (within 3 pixels)
+                circle_edge = (dist >= r - 3) & (dist <= r + 3)
+                
+                # Score = how many edge pixels fall on this circle
+                if np.sum(circle_edge) > 0:
+                    score = np.sum(edges & circle_edge) / np.sum(circle_edge)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_center = (cx, cy)
+                        best_radius = r
+    
+    return best_center, best_radius, best_score
+
+
 def detect_plate_region(rgb_array):
     """
     Detect blood agar plate using HSV color space
@@ -109,27 +169,58 @@ def detect_plate_region(rgb_array):
 
 
 def create_plate_mask(shape, rgb_array=None):
-    """Create plate mask combining circular and color detection"""
+    """
+    Create plate mask using multi-method approach:
+    1. Circular edge detection (finds petri dish boundary)
+    2. Color-based validation (confirms it's blood agar)
+    3. Combined mask with strict circular boundary
+    """
     h, w = shape[:2]
     center_y, center_x = h // 2, w // 2
-    radius = min(h, w) // 2 - 5
-    
-    # Basic circular mask (fallback)
-    y, x = np.ogrid[:h, :w]
-    dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    circular_mask = dist <= radius * 0.88  # Conservative
+    default_radius = min(h, w) // 2 - 5
     
     if rgb_array is not None:
+        # Method 1: Try to detect circular plate boundary
+        (cx, cy), detected_radius, circle_score = detect_circular_plate(rgb_array)
+        
+        # Method 2: Color-based detection
         color_mask = detect_plate_region(rgb_array)
         
-        # Combine: use color mask but only within reasonable bounds
+        # Create circular mask from detected or default center
+        y, x = np.ogrid[:h, :w]
+        
+        if circle_score > 0.15:  # Good circle detected
+            # Use detected circle with slight shrink for safety
+            dist = np.sqrt((x - cx)**2 + (y - cy)**2)
+            circular_mask = dist <= detected_radius * 0.92
+            center = (cx, cy)
+            radius = detected_radius
+        else:
+            # Fallback to center-based circle
+            dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+            circular_mask = dist <= default_radius * 0.85
+            center = (center_x, center_y)
+            radius = default_radius
+        
+        # STRICT: Use intersection of circular AND color masks
+        # This prevents hands/background from being analyzed
         combined = circular_mask & color_mask
         
-        # If color detection got enough area, use it
-        if np.sum(combined) > np.sum(circular_mask) * 0.25:
-            return combined, (center_x, center_y), radius
+        # Require at least 20% of circular area to be valid agar
+        if np.sum(combined) > np.sum(circular_mask) * 0.20:
+            # Fill small holes in the combined mask
+            from scipy import ndimage
+            combined = ndimage.binary_fill_holes(combined)
+            return combined, center, radius
+        
+        # If color detection failed, use circular only (with warning)
+        return circular_mask, center, radius
     
-    return circular_mask, (center_x, center_y), radius
+    # No RGB array - use basic circular mask
+    y, x = np.ogrid[:h, :w]
+    dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+    circular_mask = dist <= default_radius * 0.88
+    return circular_mask, (center_x, center_y), default_radius
 
 
 def watershed_colony_segmentation(binary_mask, luminance):
@@ -252,13 +343,15 @@ def iterative_threshold_detection(luminance, plate_mask, rgb_array):
     return combined
 
 
-def colony_detection_v155(rgb_array, luminance, plate_mask):
+def colony_detection_v156(rgb_array, luminance, plate_mask):
     """
-    Version 1.5.5 colony detection - fine-tuned for 80%+ accuracy
-    Target: GAS-01 (189) and GAS-03 (108) both at ~80%
+    Version 1.5.6 colony detection
+    - Balanced sensitivity from v1.5.4
+    - Better plate isolation (circular + color)
+    - 5 detection methods with weighted voting
     """
     from scipy import ndimage
-    from scipy.ndimage import gaussian_filter, maximum_filter, label
+    from scipy.ndimage import gaussian_filter, maximum_filter, label, minimum_filter
     
     # === METHOD 1: Iterative thresholding ===
     iterative_mask = iterative_threshold_detection(luminance, plate_mask, rgb_array)
@@ -272,46 +365,44 @@ def colony_detection_v155(rgb_array, luminance, plate_mask):
     bg_v = np.median(plate_v)
     bg_s = np.median(plate_s)
     
-    # MORE SENSITIVE: Catch lighter colonies
-    is_bright_hsv = v > (bg_v + 3)  # Was +5, now +3
-    is_less_saturated = s < (bg_s * 0.92)  # Was 0.90, now 0.92
+    # Balanced thresholds (between v1.5.4 and v1.5.5)
+    is_bright_hsv = v > (bg_v + 4)  # v1.5.4 was +5, v1.5.5 was +3
+    is_less_saturated = s < (bg_s * 0.91)  # v1.5.4 was 0.90, v1.5.5 was 0.92
     hsv_colonies = is_bright_hsv & is_less_saturated & plate_mask
     
     # === METHOD 3: Local maxima detection ===
-    blurred = gaussian_filter(luminance.astype(float), sigma=0.8)  # Was 1.0, tighter
-    local_max = maximum_filter(blurred, size=4)  # Was 5, smaller window
+    blurred = gaussian_filter(luminance.astype(float), sigma=0.9)  # v1.5.4 was 1.0
+    local_max = maximum_filter(blurred, size=5)
     
     plate_lum = luminance[plate_mask]
     bg_lum = np.median(plate_lum)
     std_lum = np.std(plate_lum)
     
-    # MORE SENSITIVE threshold
-    peaks = (blurred == local_max) & (luminance > bg_lum + 0.3 * std_lum) & plate_mask  # Was 0.4
+    peaks = (blurred == local_max) & (luminance > bg_lum + 0.35 * std_lum) & plate_mask
     peaks_dilated = ndimage.binary_dilation(peaks, iterations=2)
     
     # === METHOD 4: Direct luminance threshold ===
-    bright_direct = luminance > (bg_lum + 0.5 * std_lum)  # Was 0.7
+    bright_direct = luminance > (bg_lum + 0.6 * std_lum)
     bright_direct = bright_direct & plate_mask
     
-    # === METHOD 5: Edge/contrast detection (NEW) ===
-    # Colonies have edges - detect local contrast
-    from scipy.ndimage import minimum_filter
+    # === METHOD 5: Local contrast detection ===
     local_min = minimum_filter(blurred, size=5)
     local_contrast = blurred - local_min
-    high_contrast = local_contrast > (np.std(local_contrast[plate_mask]) * 0.5)
+    contrast_std = np.std(local_contrast[plate_mask])
+    high_contrast = local_contrast > (contrast_std * 0.7)  # More conservative than v1.5.5
     contrast_colonies = high_contrast & plate_mask
     
-    # === COMBINE METHODS ===
+    # === COMBINE METHODS with weighted voting ===
     method_agreement = (
         iterative_mask.astype(int) * 1.0 +
         hsv_colonies.astype(int) * 1.0 +
         peaks_dilated.astype(int) * 0.8 +
-        bright_direct.astype(int) * 0.6 +
-        contrast_colonies.astype(int) * 0.6  # New edge detection
+        bright_direct.astype(int) * 0.5 +
+        contrast_colonies.astype(int) * 0.4  # Lower weight for edge detection
     )
     
-    # MORE SENSITIVE: Accept if score >= 1.2 (was 1.5)
-    combined_mask = (method_agreement >= 1.2) & plate_mask
+    # Balanced threshold: 1.3 (between v1.5.4's 1.5 and v1.5.5's 1.2)
+    combined_mask = (method_agreement >= 1.3) & plate_mask
     
     # Light cleanup
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
@@ -330,10 +421,10 @@ def colony_detection_v155(rgb_array, luminance, plate_mask):
     colony_sizes = []
     colony_circularities = []
     
-    # OPTIMIZED filters - slightly relaxed
-    min_size = 5  # Was 6
-    max_size = 8000  # Was 6000
-    min_circ = 0.15  # Was 0.20
+    # Balanced filters
+    min_size = 5
+    max_size = 7000
+    min_circ = 0.18
     
     for i in range(1, num_features + 1):
         component = labeled == i
@@ -465,16 +556,16 @@ def generate_decision(colony_count, hemolysis, media_type):
 
 
 def analyze_plate(image_bytes, media_type='blood_agar'):
-    """Main analysis function - v1.5.5"""
+    """Main analysis function - v1.5.6"""
     img = load_and_resize_image(image_bytes)
     
-    # Create plate mask with color detection
+    # Create plate mask with improved circular + color detection
     plate_mask, center, radius = create_plate_mask(img.shape, rgb_array=img)
     
     luminance = get_luminance(img)
     
-    # Colony detection with fine-tuned algorithm
-    colony_count, avg_size, avg_circ, labeled = colony_detection_v155(
+    # Colony detection with balanced algorithm
+    colony_count, avg_size, avg_circ, labeled = colony_detection_v156(
         img, luminance, plate_mask
     )
     
@@ -501,7 +592,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'analyzed_size': list(img.shape[:2]),
             'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
-        'version': '1.5.5-tuned'
+        'version': '1.5.6-circle-detect'
     }
 
 
@@ -510,15 +601,15 @@ def health():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.5.5-tuned',
+        'version': '1.5.6-circle-detect',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'algorithms': [
-            'HSV color space analysis',
+            'Circular plate boundary detection',
+            'HSV color-based agar validation',
             'Iterative adaptive thresholding',
             'Watershed segmentation',
-            '5-method voting system',
-            'Edge/contrast detection',
+            '5-method weighted voting',
             'Halo-based hemolysis detection'
         ],
         'target_accuracy': '80%+'
