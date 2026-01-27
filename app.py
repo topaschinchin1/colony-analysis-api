@@ -252,65 +252,63 @@ def iterative_threshold_detection(luminance, plate_mask, rgb_array):
     return combined
 
 
-def colony_detection_v153(rgb_array, luminance, plate_mask):
+def colony_detection_v154(rgb_array, luminance, plate_mask):
     """
-    Version 1.5.3 colony detection with research-based improvements:
-    1. HSV-based colony identification
-    2. Iterative thresholding (OpenCFU style)
-    3. Watershed segmentation for touching colonies
-    4. Circularity + size filtering
+    Version 1.5.4 colony detection - balanced for both plate types
+    Fixes: v1.5.3 was too strict, missing darker colonies
     """
     from scipy import ndimage
     from scipy.ndimage import gaussian_filter, maximum_filter, label
     
-    # === METHOD 1: Iterative thresholding ===
+    # === METHOD 1: Iterative thresholding (more sensitive) ===
     iterative_mask = iterative_threshold_detection(luminance, plate_mask, rgb_array)
     
-    # === METHOD 2: HSV-based detection ===
+    # === METHOD 2: HSV-based detection (relaxed thresholds) ===
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
-    # Colonies are typically: low saturation (whitish/cream) and bright
     plate_v = v[plate_mask]
     plate_s = s[plate_mask]
     bg_v = np.median(plate_v)
     bg_s = np.median(plate_s)
     
-    # Colony criteria in HSV:
-    # - Brighter than background (high V)
-    # - Less saturated than agar (colonies are cream/white, agar is red)
-    is_bright_hsv = v > (bg_v + 10)
-    is_less_saturated = s < (bg_s * 0.85)  # Much less red saturation
+    # RELAXED: Lower brightness threshold to catch darker colonies
+    is_bright_hsv = v > (bg_v + 5)  # Was +10, now +5
+    is_less_saturated = s < (bg_s * 0.90)  # Was 0.85, now 0.90 (less strict)
     hsv_colonies = is_bright_hsv & is_less_saturated & plate_mask
     
-    # === METHOD 3: Local maxima detection ===
-    blurred = gaussian_filter(luminance.astype(float), sigma=1.2)
+    # === METHOD 3: Local maxima detection (more sensitive) ===
+    blurred = gaussian_filter(luminance.astype(float), sigma=1.0)  # Was 1.2
     local_max = maximum_filter(blurred, size=5)
     
     plate_lum = luminance[plate_mask]
     bg_lum = np.median(plate_lum)
     std_lum = np.std(plate_lum)
     
-    peaks = (blurred == local_max) & (luminance > bg_lum + 0.5 * std_lum) & plate_mask
+    # RELAXED: Lower threshold
+    peaks = (blurred == local_max) & (luminance > bg_lum + 0.4 * std_lum) & plate_mask  # Was 0.5
     peaks_dilated = ndimage.binary_dilation(peaks, iterations=2)
     
+    # === METHOD 4: Direct luminance threshold (new - catches what others miss) ===
+    bright_direct = luminance > (bg_lum + 0.7 * std_lum)  # Simple brightness check
+    bright_direct = bright_direct & plate_mask
+    
     # === COMBINE METHODS ===
-    # Require agreement from multiple methods for robustness
+    # Weight the methods and use lower threshold
     method_agreement = (
-        iterative_mask.astype(int) + 
-        hsv_colonies.astype(int) + 
-        peaks_dilated.astype(int)
+        iterative_mask.astype(int) * 1.0 +  # Good general detection
+        hsv_colonies.astype(int) * 1.0 +     # Color-based
+        peaks_dilated.astype(int) * 0.8 +    # Peak detection
+        bright_direct.astype(int) * 0.5      # Fallback
     )
     
-    # Accept if 2+ methods agree
-    combined_mask = (method_agreement >= 2) & plate_mask
+    # RELAXED: Accept if score >= 1.5 (was 2.0)
+    combined_mask = (method_agreement >= 1.5) & plate_mask
     
-    # Light cleanup
+    # Light cleanup (less aggressive)
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
-    combined_mask = ndimage.binary_closing(combined_mask, iterations=1)
     
     # === WATERSHED SEGMENTATION ===
-    # Separate touching colonies
     segmented, num_segments = watershed_colony_segmentation(combined_mask, luminance)
     
     # === FILTER BY SIZE AND CIRCULARITY ===
@@ -318,21 +316,25 @@ def colony_detection_v153(rgb_array, luminance, plate_mask):
         labeled = segmented
         num_features = int(segmented.max())
     else:
-        # Fallback
         labeled, num_features = label(combined_mask)
     
     valid_colonies = 0
     colony_sizes = []
     colony_circularities = []
     
+    # RELAXED size constraints
+    min_size = 6  # Was 8
+    max_size = 6000  # Was 5000
+    min_circ = 0.20  # Was 0.25
+    
     for i in range(1, num_features + 1):
         component = labeled == i
         size = np.sum(component)
         
-        if MIN_COLONY_SIZE <= size <= MAX_COLONY_SIZE:
+        if min_size <= size <= max_size:
             circ = calculate_circularity(component)
             
-            if circ >= MIN_CIRCULARITY:
+            if circ >= min_circ:
                 valid_colonies += 1
                 colony_sizes.append(size)
                 colony_circularities.append(circ)
@@ -345,46 +347,61 @@ def colony_detection_v153(rgb_array, luminance, plate_mask):
 
 def detect_hemolysis_hsv(rgb_array, plate_mask):
     """
-    Hemolysis detection using HSV color space
-    Based on Savardi et al. approach
+    Hemolysis detection using HSV color space - v1.5.4 FIXED
     
-    Beta hemolysis: Clear zones (high V, low S, neutral H)
-    Alpha hemolysis: Green zones (H shifts toward green ~60-120)
+    Beta hemolysis: Clear zones around colonies (high V, low S)
+    Alpha hemolysis: Green zones (H shifts toward green)
     Gamma: No change from background
     """
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
-    # Background stats (blood agar)
     plate_h = h[plate_mask]
     plate_s = s[plate_mask]
     plate_v = v[plate_mask]
     
-    bg_h = np.median(plate_h)  # Should be ~0-30 (red)
-    bg_s = np.median(plate_s)  # High saturation
-    bg_v = np.median(plate_v)  # Medium brightness
+    bg_h = np.median(plate_h)
+    bg_s = np.median(plate_s)
+    bg_v = np.median(plate_v)
     
-    # === BETA HEMOLYSIS ===
-    # Clear zones: very bright, desaturated (no red color)
-    # The blood is completely lysed, zone appears yellowish/clear
-    is_bright = v > (bg_v + 15)
-    is_desaturated = s < (bg_s * 0.7)  # Much less color
-    beta_zones = is_bright & is_desaturated & plate_mask
-    beta_ratio = np.sum(beta_zones) / np.sum(plate_mask) if np.sum(plate_mask) > 0 else 0
+    # === BETA HEMOLYSIS (FIXED - more sensitive) ===
+    # Clear zones: brighter AND/OR less saturated than background
+    is_bright = v > (bg_v + 8)  # Was +15
+    is_desaturated = s < (bg_s * 0.80)  # Was 0.7
+    
+    # Beta can be detected by EITHER brightness OR desaturation
+    beta_zones = (is_bright | is_desaturated) & plate_mask
+    
+    # But exclude the very center (colonies themselves are also bright)
+    # Focus on the halo region
+    from scipy.ndimage import binary_erosion, binary_dilation
+    
+    # Find colony-like bright spots
+    very_bright = v > (bg_v + 25)
+    colony_cores = very_bright & plate_mask
+    
+    # Dilate to get halo region
+    if np.any(colony_cores):
+        halo_region = binary_dilation(colony_cores, iterations=8) & ~colony_cores
+        beta_in_halo = beta_zones & halo_region
+        beta_ratio = np.sum(beta_in_halo) / np.sum(plate_mask) if np.sum(plate_mask) > 0 else 0
+    else:
+        beta_ratio = np.sum(beta_zones) / np.sum(plate_mask) if np.sum(plate_mask) > 0 else 0
+    
+    # Also check overall desaturation (clear plates have less red)
+    overall_desat = np.mean(plate_s) < 120  # Blood agar normally has high saturation
     
     # === ALPHA HEMOLYSIS ===
-    # Green zones: hue shifts toward green (60-150), slightly darker
-    # Hemoglobin oxidizes to methemoglobin (green-brown)
-    is_greenish = (h > 40) & (h < 160)  # Green-yellow range
-    is_darker = v < (bg_v - 5)
+    is_greenish = (h > 40) & (h < 160)
+    is_darker = v < (bg_v - 3)  # Was -5
     alpha_zones = is_greenish & is_darker & plate_mask
     alpha_ratio = np.sum(alpha_zones) / np.sum(plate_mask) if np.sum(plate_mask) > 0 else 0
     
-    # === CLASSIFICATION ===
-    if beta_ratio > 0.03:  # 3%+ clear zones = beta
+    # === CLASSIFICATION (more sensitive to beta) ===
+    if beta_ratio > 0.02 or overall_desat:  # Was 0.03
         hemo_type = 'beta'
-        confidence = min(0.95, 0.55 + beta_ratio * 3)
-    elif alpha_ratio > 0.05:  # 5%+ green zones = alpha
+        confidence = min(0.95, 0.60 + beta_ratio * 4)
+    elif alpha_ratio > 0.04:  # Was 0.05
         hemo_type = 'alpha'
         confidence = min(0.90, 0.50 + alpha_ratio * 3)
     else:
@@ -440,7 +457,7 @@ def generate_decision(colony_count, hemolysis, media_type):
 
 
 def analyze_plate(image_bytes, media_type='blood_agar'):
-    """Main analysis function - v1.5.3"""
+    """Main analysis function - v1.5.4"""
     img = load_and_resize_image(image_bytes)
     
     # Create plate mask with color detection
@@ -448,12 +465,12 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
     
     luminance = get_luminance(img)
     
-    # Colony detection with new algorithm
-    colony_count, avg_size, avg_circ, labeled = colony_detection_v153(
+    # Colony detection with balanced algorithm
+    colony_count, avg_size, avg_circ, labeled = colony_detection_v154(
         img, luminance, plate_mask
     )
     
-    # Hemolysis detection with HSV
+    # Hemolysis detection with HSV (fixed)
     hemolysis = detect_hemolysis_hsv(img, plate_mask)
     
     # Generate decision
@@ -476,7 +493,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'analyzed_size': list(img.shape[:2]),
             'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
-        'version': '1.5.3-research'
+        'version': '1.5.4-balanced'
     }
 
 
@@ -485,19 +502,15 @@ def health():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.5.3-research',
+        'version': '1.5.4-balanced',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'algorithms': [
             'HSV color space analysis',
             'Iterative adaptive thresholding',
             'Watershed segmentation',
-            'Circularity filtering'
-        ],
-        'based_on': [
-            'OpenCFU (recursive thresholding)',
-            'CFUCounter (watershed + local minima)',
-            'Savardi et al. (HSV hemolysis detection)'
+            'Multi-method voting (relaxed)',
+            'Halo-based hemolysis detection'
         ]
     })
 
