@@ -1,11 +1,12 @@
 """
 Colony Counting and Hemolysis Detection API
-Version: 1.6.3 - Balanced parameters (between v1.6.1 and v1.6.2)
+Version: 1.6.4 - Tuned closer to v1.6.1 (which gave 270)
 
 TARGET: 189 CFU for GAS-01
-- v1.6.1: 270 (too high)
+- v1.6.1: 270 (too high) - parameters were good, just slightly too sensitive
 - v1.6.2: 123 (too low)
-- v1.6.3: Split the difference
+- v1.6.3: 123 (same as v1.6.2 - didn't help)
+- v1.6.4: Closer to v1.6.1 with minor tightening
 
 Based on:
 - CFUCounter: r=0.999 correlation with manual counts
@@ -27,10 +28,10 @@ app = Flask(__name__)
 MAX_IMAGE_SIZE = 800
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
 
-# Colony detection parameters - BALANCED
-MIN_COLONY_SIZE = 10      # pixels (between 10 and 12)
+# Colony detection parameters - closer to v1.6.1
+MIN_COLONY_SIZE = 10      # same as v1.6.1
 MAX_COLONY_SIZE = 5000    # pixels
-MIN_CIRCULARITY = 0.26    # (between 0.25 and 0.28)
+MIN_CIRCULARITY = 0.25    # same as v1.6.1
 BRIGHTNESS_THRESHOLD = 0.8
 
 
@@ -283,17 +284,17 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     bg_enhanced = np.median(plate_pixels)
     std_enhanced = np.std(plate_pixels)
     
-    # === METHOD 1: Adaptive thresholding - BALANCED ===
+    # === METHOD 1: Adaptive thresholding - closer to v1.6.1 ===
     adaptive_detections = np.zeros_like(luminance, dtype=float)
     
-    # Middle C values (between 8,12,16 and 12,16,20)
+    # C values closer to v1.6.1 (8,12,16) but slightly higher
     for block_size in [41, 61, 81]:
-        for C_val in [10, 14, 18]:
+        for C_val in [9, 13, 17]:
             adaptive_mask = adaptive_threshold(enhanced, block_size=block_size, C=C_val)
             adaptive_mask = adaptive_mask & plate_mask
             adaptive_detections += adaptive_mask.astype(float) / 9
     
-    method1_mask = (adaptive_detections >= 0.42) & plate_mask  # Between 0.4 and 0.45
+    method1_mask = (adaptive_detections >= 0.40) & plate_mask  # Same as v1.6.1
     method1_weight = 1.2
     
     # === METHOD 2: HSV-based detection (STRICTER) ===
@@ -305,9 +306,9 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     bg_v = np.median(plate_v)
     bg_s = np.median(plate_s)
     
-    # Balanced thresholds (between v1.6.1 and v1.6.2)
-    is_bright_hsv = v > (bg_v + 13)  # Between 12 and 15
-    is_less_saturated = s < (bg_s * 0.81)  # Between 0.80 and 0.82
+    # Thresholds closer to v1.6.1 (which worked better)
+    is_bright_hsv = v > (bg_v + 12)  # Same as v1.6.1
+    is_less_saturated = s < (bg_s * 0.82)  # Same as v1.6.1
     method2_mask = is_bright_hsv & is_less_saturated & plate_mask
     method2_weight = 1.0
     
@@ -320,12 +321,12 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     method3_mask = ndimage.binary_dilation(peaks, iterations=2)
     method3_weight = 0.8
     
-    # === METHOD 4: Direct intensity threshold - BALANCED ===
-    intensity_thresh = bg_enhanced + 0.9 * std_enhanced  # Between 0.8 and 1.0
+    # === METHOD 4: Direct intensity threshold - closer to v1.6.1 ===
+    intensity_thresh = bg_enhanced + 0.85 * std_enhanced  # Between 0.8 (v1.6.1) and 0.9
     method4_mask = (enhanced > intensity_thresh) & plate_mask
     method4_weight = 0.7
     
-    # === WEIGHTED VOTING - 50% threshold (between 45% and 55%) ===
+    # === WEIGHTED VOTING - 47% threshold (closer to v1.6.1's 45%) ===
     weighted_score = (
         method1_mask.astype(float) * method1_weight +
         method2_mask.astype(float) * method2_weight +
@@ -335,8 +336,8 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     
     total_weight = method1_weight + method2_weight + method3_weight + method4_weight
     
-    # Require 50% weighted agreement (between 45% and 55%)
-    combined_mask = (weighted_score >= total_weight * 0.50) & plate_mask
+    # Require 47% weighted agreement (closer to v1.6.1's 45%)
+    combined_mask = (weighted_score >= total_weight * 0.47) & plate_mask
     
     # === MORPHOLOGICAL CLEANUP ===
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
@@ -515,7 +516,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
         'debug': debug_info,
-        'version': '1.6.3-balanced'
+        'version': '1.6.4-tuned'
     }
 
 
@@ -524,20 +525,20 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.6.3-balanced',
+        'version': '1.6.4-tuned',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'algorithms': [
             'CLAHE preprocessing (clip=2.0)',
             'Noise reduction (median filter)',
-            'Adaptive thresholding (C=10,14,18)',
+            'Adaptive thresholding (C=9,13,17)',
             'HSV color space analysis',
             'Local maxima detection',
             'Improved watershed segmentation',
-            'Weighted voting (50% threshold)',
-            'Circularity filtering (0.26)'
+            'Weighted voting (47% threshold)',
+            'Circularity filtering (0.25)'
         ],
-        'tuning': 'Balanced parameters v1.6.3 - targeting 189 CFU'
+        'tuning': 'v1.6.4 - closer to v1.6.1 parameters'
     })
 
 
@@ -549,7 +550,7 @@ def warmup():
     """
     return jsonify({
         'status': 'warm',
-        'version': '1.6.3-balanced',
+        'version': '1.6.4-tuned',
         'message': 'Service is ready for analysis'
     })
 
