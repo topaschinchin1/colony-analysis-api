@@ -1,15 +1,17 @@
 """
 Colony Counting and Hemolysis Detection API
-Version: 1.6.6 - Fixed watershed over-segmentation
+Version: 1.7.0 - Dual-mode detection
 
-FIX: Removed intensity peaks from watershed markers
-- Intensity peaks were causing over-segmentation
-- Now using only distance transform peaks
+TWO DETECTION MODES:
+1. "sensitive" - Best for sparse/low-density plates (like GAS-03)
+   - Lower thresholds, catches more colonies
+   - Based on v1.5.3 parameters (114 CFU for GAS-03, target 108)
 
-Based on:
-- CFUCounter: r=0.999 correlation with manual counts
-- OpenCFU: Recursive thresholding + score maps
-- Savardi et al.: HSV color space for hemolysis detection
+2. "strict" - Best for dense/high-density plates (like GAS-01)  
+   - Higher thresholds, filters more aggressively
+   - Based on v1.6.2 parameters but tuned
+
+User selects mode via 'detection_mode' parameter in the form.
 """
 
 import os
@@ -25,12 +27,37 @@ app = Flask(__name__)
 # Configuration
 MAX_IMAGE_SIZE = 800
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
+DETECTION_MODES = ['sensitive', 'strict', 'auto']
 
-# Colony detection parameters - closer to v1.6.1
-MIN_COLONY_SIZE = 10      # same as v1.6.1
-MAX_COLONY_SIZE = 5000    # pixels
-MIN_CIRCULARITY = 0.25    # same as v1.6.1
-BRIGHTNESS_THRESHOLD = 0.8
+# Mode-specific parameters
+MODE_PARAMS = {
+    'sensitive': {
+        # Based on v1.5.3 - good for GAS-03 (sparse plates)
+        'min_colony_size': 8,
+        'max_colony_size': 5000,
+        'min_circularity': 0.25,
+        'adaptive_c_values': [5, 8, 12],
+        'voting_threshold': 0.35,
+        'hsv_brightness_offset': 8,
+        'hsv_saturation_ratio': 0.88,
+        'intensity_std_multiplier': 0.5,
+        'watershed_footprint': 9,
+        'watershed_percentile': 30,
+    },
+    'strict': {
+        # Tuned for GAS-01 (dense plates)
+        'min_colony_size': 12,
+        'max_colony_size': 5000,
+        'min_circularity': 0.28,
+        'adaptive_c_values': [12, 16, 20],
+        'voting_threshold': 0.55,
+        'hsv_brightness_offset': 15,
+        'hsv_saturation_ratio': 0.78,
+        'intensity_std_multiplier': 1.0,
+        'watershed_footprint': 13,
+        'watershed_percentile': 60,
+    }
+}
 
 
 def load_and_resize_image(image_bytes):
@@ -50,10 +77,7 @@ def load_and_resize_image(image_bytes):
 
 
 def apply_clahe(gray_image, clip_limit=2.0, tile_size=8):
-    """
-    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    Reduced clip_limit from 2.5 to 2.0 to reduce over-enhancement
-    """
+    """Apply CLAHE for contrast enhancement"""
     if gray_image.dtype != np.uint8:
         img_normalized = ((gray_image - gray_image.min()) / 
                          (gray_image.max() - gray_image.min() + 1e-8) * 255).astype(np.uint8)
@@ -77,7 +101,7 @@ def apply_clahe(gray_image, clip_limit=2.0, tile_size=8):
                 continue
                 
             tile = img_normalized[y1:y2, x1:x2]
-            hist, bins = np.histogram(tile.flatten(), bins=256, range=(0, 256))
+            hist, _ = np.histogram(tile.flatten(), bins=256, range=(0, 256))
             clip_threshold = clip_limit * tile.size / 256
             excess = np.sum(np.maximum(hist - clip_threshold, 0))
             hist = np.minimum(hist, clip_threshold)
@@ -89,29 +113,16 @@ def apply_clahe(gray_image, clip_limit=2.0, tile_size=8):
     return result.astype(np.uint8)
 
 
-def apply_noise_reduction(gray_image, method='median', kernel_size=3):
-    """Apply noise reduction preprocessing"""
+def apply_noise_reduction(gray_image, kernel_size=3):
+    """Apply median filter for noise reduction"""
     from scipy import ndimage
-    
-    if method == 'median':
-        return ndimage.median_filter(gray_image, size=kernel_size)
-    elif method == 'gaussian':
-        return ndimage.gaussian_filter(gray_image, sigma=kernel_size/3)
-    else:
-        return gray_image
+    return ndimage.median_filter(gray_image, size=kernel_size)
 
 
-def adaptive_threshold(gray_image, block_size=51, C=10, method='gaussian'):
-    """
-    Adaptive thresholding - increased C value for less sensitivity
-    """
+def adaptive_threshold(gray_image, block_size=51, C=10):
+    """Adaptive thresholding"""
     from scipy import ndimage
-    
-    if method == 'gaussian':
-        local_mean = ndimage.gaussian_filter(gray_image.astype(float), sigma=block_size/6)
-    else:
-        local_mean = ndimage.uniform_filter(gray_image.astype(float), size=block_size)
-    
+    local_mean = ndimage.gaussian_filter(gray_image.astype(float), sigma=block_size/6)
     binary = gray_image > (local_mean + C)
     return binary
 
@@ -133,10 +144,8 @@ def rgb_to_hsv(rgb_array):
     
     idx = (max_c == r) & mask
     h[idx] = (60 * ((g[idx] - b[idx]) / diff[idx]) + 360) % 360
-    
     idx = (max_c == g) & mask
     h[idx] = (60 * ((b[idx] - r[idx]) / diff[idx]) + 120) % 360
-    
     idx = (max_c == b) & mask
     h[idx] = (60 * ((r[idx] - g[idx]) / diff[idx]) + 240) % 360
     
@@ -153,11 +162,9 @@ def detect_plate_region(rgb_array):
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
-    is_red = ((h <= 30) | (h >= 330)) & (s > 50) & (v > 40) & (v < 240)
     is_red_expanded = ((h <= 45) | (h >= 315)) & (s > 40) & (v > 30) & (v < 250)
     
     from scipy import ndimage
-    
     agar_mask = ndimage.binary_closing(is_red_expanded, iterations=8)
     agar_mask = ndimage.binary_opening(agar_mask, iterations=4)
     agar_mask = ndimage.binary_fill_holes(agar_mask)
@@ -184,8 +191,26 @@ def create_plate_mask(shape, rgb_array=None):
     return circular_mask, (center_x, center_y), radius
 
 
-def improved_watershed_segmentation(binary_mask, intensity_image):
-    """Simplified watershed - distance transform only, no intensity peaks"""
+def calculate_circularity(component_mask):
+    """Calculate circularity of a component"""
+    from scipy import ndimage
+    
+    area = np.sum(component_mask)
+    if area == 0:
+        return 0
+    
+    dilated = ndimage.binary_dilation(component_mask)
+    perimeter = np.sum(dilated & ~component_mask)
+    
+    if perimeter == 0:
+        return 0
+    
+    circularity = 4 * np.pi * area / (perimeter ** 2)
+    return min(circularity, 1.0)
+
+
+def watershed_segmentation(binary_mask, intensity_image, params):
+    """Watershed segmentation with mode-specific parameters"""
     from scipy import ndimage
     from scipy.ndimage import distance_transform_edt, label, maximum_filter
     
@@ -193,20 +218,15 @@ def improved_watershed_segmentation(binary_mask, intensity_image):
         return np.zeros_like(binary_mask, dtype=int), 0
     
     distance = distance_transform_edt(binary_mask)
-    footprint_size = 11  # Larger footprint = fewer peaks = less over-segmentation
+    footprint_size = params['watershed_footprint']
     local_max = maximum_filter(distance, size=footprint_size)
     
-    # Higher threshold for peak detection - only clear colony centers
-    distance_threshold = max(4, np.percentile(distance[binary_mask], 50))
+    distance_threshold = max(3, np.percentile(distance[binary_mask], params['watershed_percentile']))
     peaks = (distance == local_max) & (distance >= distance_threshold) & binary_mask
-    
-    # NO intensity peaks - they cause over-segmentation
-    # peaks = peaks | (intensity_peaks & (distance > 2))  # REMOVED
     
     markers, num_markers = label(peaks)
     
     if num_markers == 0:
-        # No clear peaks found - just use connected components
         labeled, num_features = label(binary_mask)
         return labeled, num_features
     
@@ -234,67 +254,48 @@ def improved_watershed_segmentation(binary_mask, intensity_image):
     
     remaining = binary_mask & (segmented == 0)
     if np.any(remaining):
-        remaining_labeled, num_remaining = label(remaining)
+        remaining_labeled, _ = label(remaining)
         max_label = segmented.max()
         segmented = np.where(remaining, remaining_labeled + max_label, segmented)
     
     return segmented, int(segmented.max())
 
 
-def calculate_circularity(component_mask):
-    """Calculate circularity of a component"""
-    from scipy import ndimage
-    
-    area = np.sum(component_mask)
-    if area == 0:
-        return 0
-    
-    dilated = ndimage.binary_dilation(component_mask)
-    perimeter = np.sum(dilated & ~component_mask)
-    
-    if perimeter == 0:
-        return 0
-    
-    circularity = 4 * np.pi * area / (perimeter ** 2)
-    return min(circularity, 1.0)
-
-
-def colony_detection_v161(rgb_array, luminance, plate_mask):
+def colony_detection_dual_mode(rgb_array, luminance, plate_mask, mode='sensitive'):
     """
-    Version 1.6.1 colony detection - TUNED to reduce overcounting
+    Dual-mode colony detection
     
-    Changes from v1.6.0:
-    - Higher C values in adaptive thresholding (8,12,16 instead of 5,8,12)
-    - Higher weighted voting threshold (45% instead of 35%)
-    - Stricter HSV detection
-    - Larger minimum colony size
+    mode='sensitive': Better for sparse plates (GAS-03 style)
+    mode='strict': Better for dense plates (GAS-01 style)
     """
     from scipy import ndimage
     from scipy.ndimage import gaussian_filter, maximum_filter, label
     
+    params = MODE_PARAMS[mode]
+    
     # === PREPROCESSING ===
-    denoised = apply_noise_reduction(luminance, method='median', kernel_size=3)
+    denoised = apply_noise_reduction(luminance, kernel_size=3)
     enhanced = apply_clahe(denoised.astype(np.uint8), clip_limit=2.0, tile_size=8)
     enhanced = enhanced.astype(float)
     
     plate_pixels = enhanced[plate_mask]
-    bg_enhanced = np.median(plate_pixels)
-    std_enhanced = np.std(plate_pixels)
+    bg_mean = np.median(plate_pixels)
+    bg_std = np.std(plate_pixels)
     
-    # === METHOD 1: Adaptive thresholding - closer to v1.6.1 ===
+    # === METHOD 1: Adaptive thresholding ===
     adaptive_detections = np.zeros_like(luminance, dtype=float)
+    c_values = params['adaptive_c_values']
     
-    # C values closer to v1.6.1 (8,12,16) but slightly higher
     for block_size in [41, 61, 81]:
-        for C_val in [9, 13, 17]:
+        for C_val in c_values:
             adaptive_mask = adaptive_threshold(enhanced, block_size=block_size, C=C_val)
             adaptive_mask = adaptive_mask & plate_mask
             adaptive_detections += adaptive_mask.astype(float) / 9
     
-    method1_mask = (adaptive_detections >= 0.40) & plate_mask  # Same as v1.6.1
+    method1_mask = (adaptive_detections >= 0.35) & plate_mask
     method1_weight = 1.2
     
-    # === METHOD 2: HSV-based detection (STRICTER) ===
+    # === METHOD 2: HSV-based detection ===
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
     
@@ -303,27 +304,28 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     bg_v = np.median(plate_v)
     bg_s = np.median(plate_s)
     
-    # Thresholds closer to v1.6.1 (which worked better)
-    is_bright_hsv = v > (bg_v + 12)  # Same as v1.6.1
-    is_less_saturated = s < (bg_s * 0.82)  # Same as v1.6.1
+    brightness_offset = params['hsv_brightness_offset']
+    saturation_ratio = params['hsv_saturation_ratio']
+    
+    is_bright_hsv = v > (bg_v + brightness_offset)
+    is_less_saturated = s < (bg_s * saturation_ratio)
     method2_mask = is_bright_hsv & is_less_saturated & plate_mask
     method2_weight = 1.0
     
-    # === METHOD 3: Local maxima detection (STRICTER) ===
+    # === METHOD 3: Local maxima detection ===
     blurred = gaussian_filter(enhanced, sigma=1.2)
-    local_max = maximum_filter(blurred, size=7)  # Increased from 5
-    
-    # Higher threshold
-    peaks = (blurred == local_max) & (enhanced > bg_enhanced + 0.6 * std_enhanced) & plate_mask
+    local_max = maximum_filter(blurred, size=5)
+    peaks = (blurred == local_max) & (enhanced > bg_mean + 0.4 * bg_std) & plate_mask
     method3_mask = ndimage.binary_dilation(peaks, iterations=2)
     method3_weight = 0.8
     
-    # === METHOD 4: Direct intensity threshold - closer to v1.6.1 ===
-    intensity_thresh = bg_enhanced + 0.85 * std_enhanced  # Between 0.8 (v1.6.1) and 0.9
+    # === METHOD 4: Direct intensity threshold ===
+    intensity_multiplier = params['intensity_std_multiplier']
+    intensity_thresh = bg_mean + intensity_multiplier * bg_std
     method4_mask = (enhanced > intensity_thresh) & plate_mask
     method4_weight = 0.7
     
-    # === WEIGHTED VOTING - 47% threshold (closer to v1.6.1's 45%) ===
+    # === WEIGHTED VOTING ===
     weighted_score = (
         method1_mask.astype(float) * method1_weight +
         method2_mask.astype(float) * method2_weight +
@@ -332,9 +334,9 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     )
     
     total_weight = method1_weight + method2_weight + method3_weight + method4_weight
+    voting_threshold = params['voting_threshold']
     
-    # Require 47% weighted agreement (closer to v1.6.1's 45%)
-    combined_mask = (weighted_score >= total_weight * 0.47) & plate_mask
+    combined_mask = (weighted_score >= total_weight * voting_threshold) & plate_mask
     
     # === MORPHOLOGICAL CLEANUP ===
     combined_mask = ndimage.binary_opening(combined_mask, iterations=1)
@@ -342,9 +344,9 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     combined_mask = ndimage.binary_fill_holes(combined_mask)
     
     # === WATERSHED SEGMENTATION ===
-    segmented, num_segments = improved_watershed_segmentation(combined_mask, enhanced)
+    segmented, num_segments = watershed_segmentation(combined_mask, enhanced, params)
     
-    # === FILTER BY SIZE AND CIRCULARITY (STRICTER) ===
+    # === FILTER BY SIZE AND CIRCULARITY ===
     if isinstance(segmented, np.ndarray) and segmented.max() > 0:
         labeled = segmented
         num_features = int(segmented.max())
@@ -355,9 +357,9 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     colony_sizes = []
     colony_circularities = []
     
-    min_size = MIN_COLONY_SIZE      # 10 pixels (increased)
-    max_size = MAX_COLONY_SIZE      # 5000 pixels
-    min_circ = MIN_CIRCULARITY      # 0.25 (restored)
+    min_size = params['min_colony_size']
+    max_size = params['max_colony_size']
+    min_circ = params['min_circularity']
     
     for i in range(1, num_features + 1):
         component = labeled == i
@@ -375,14 +377,16 @@ def colony_detection_v161(rgb_array, luminance, plate_mask):
     avg_circ = np.mean(colony_circularities) if colony_circularities else 0
     
     debug_info = {
+        'mode': mode,
+        'voting_threshold': voting_threshold,
         'method1_detections': int(np.sum(method1_mask)),
         'method2_detections': int(np.sum(method2_mask)),
         'method3_detections': int(np.sum(method3_mask)),
         'method4_detections': int(np.sum(method4_mask)),
         'combined_pixels': int(np.sum(combined_mask)),
         'segments_before_filter': num_features,
-        'bg_enhanced': round(float(bg_enhanced), 1),
-        'std_enhanced': round(float(std_enhanced), 1)
+        'bg_mean': round(float(bg_mean), 1),
+        'bg_std': round(float(bg_std), 1)
     }
     
     return valid_colonies, avg_size, avg_circ, labeled, debug_info
@@ -405,7 +409,7 @@ def detect_hemolysis_hsv(rgb_array, plate_mask):
     is_desaturated = s < (bg_s * 0.80)
     beta_zones = (is_bright | is_desaturated) & plate_mask
     
-    from scipy.ndimage import binary_erosion, binary_dilation
+    from scipy.ndimage import binary_dilation
     
     very_bright = v > (bg_v + 25)
     colony_cores = very_bright & plate_mask
@@ -482,14 +486,18 @@ def generate_decision(colony_count, hemolysis, media_type):
     }
 
 
-def analyze_plate(image_bytes, media_type='blood_agar'):
-    """Main analysis function - v1.6.1"""
+def analyze_plate(image_bytes, media_type='blood_agar', detection_mode='sensitive'):
+    """Main analysis function - v1.7.0 with dual mode"""
     img = load_and_resize_image(image_bytes)
     plate_mask, center, radius = create_plate_mask(img.shape, rgb_array=img)
     luminance = get_luminance(img)
     
-    colony_count, avg_size, avg_circ, labeled, debug_info = colony_detection_v161(
-        img, luminance, plate_mask
+    # Validate detection mode
+    if detection_mode not in ['sensitive', 'strict']:
+        detection_mode = 'sensitive'
+    
+    colony_count, avg_size, avg_circ, labeled, debug_info = colony_detection_dual_mode(
+        img, luminance, plate_mask, mode=detection_mode
     )
     
     hemolysis = detect_hemolysis_hsv(img, plate_mask)
@@ -498,6 +506,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
     return {
         'status': 'success',
         'colony_count': colony_count,
+        'detection_mode': detection_mode,
         'decision_label': decision['label'],
         'decision_confidence': decision['confidence'],
         'requires_manual_review': decision['requires_review'],
@@ -513,7 +522,7 @@ def analyze_plate(image_bytes, media_type='blood_agar'):
             'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
         },
         'debug': debug_info,
-        'version': '1.6.6-watershed-fix'
+        'version': '1.7.0-dual-mode'
     }
 
 
@@ -522,32 +531,31 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.6.6-watershed-fix',
+        'version': '1.7.0-dual-mode',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
+        'detection_modes': {
+            'sensitive': 'Best for sparse/low-density plates - catches more colonies',
+            'strict': 'Best for dense/high-density plates - filters more aggressively'
+        },
         'algorithms': [
-            'CLAHE preprocessing (clip=2.0)',
-            'Noise reduction (median filter)',
-            'Adaptive thresholding (C=9,13,17)',
+            'CLAHE preprocessing',
+            'Adaptive thresholding (mode-specific C values)',
             'HSV color space analysis',
             'Local maxima detection',
-            'Improved watershed segmentation',
-            'Weighted voting (47% threshold)',
-            'Circularity filtering (0.25)'
-        ],
-        'tuning': 'v1.6.4 - closer to v1.6.1 parameters'
+            'Weighted voting (mode-specific threshold)',
+            'Watershed segmentation',
+            'Circularity filtering'
+        ]
     })
 
 
 @app.route('/warmup', methods=['GET'])
 def warmup():
-    """
-    Warm-up endpoint - call this before /analyze to wake up the service
-    Returns immediately with minimal processing
-    """
+    """Warm-up endpoint"""
     return jsonify({
         'status': 'warm',
-        'version': '1.6.6-watershed-fix',
+        'version': '1.7.0-dual-mode',
         'message': 'Service is ready for analysis'
     })
 
@@ -560,18 +568,26 @@ def analyze():
         if media_type not in SUPPORTED_MEDIA_TYPES:
             media_type = 'blood_agar'
         
+        # Get detection mode - NEW PARAMETER
+        detection_mode = request.form.get('detection_mode', 'sensitive')
+        if detection_mode not in DETECTION_MODES:
+            detection_mode = 'sensitive'
+        
         if 'image' in request.files:
             file = request.files['image']
             if file and file.filename:
                 image_bytes = file.read()
-                result = analyze_plate(image_bytes, media_type)
+                result = analyze_plate(image_bytes, media_type, detection_mode)
                 return jsonify(result)
         
         if request.is_json:
             data = request.get_json()
             if data and 'image_base64' in data:
                 image_bytes = base64.b64decode(data['image_base64'])
-                result = analyze_plate(image_bytes, media_type)
+                dm = data.get('detection_mode', 'sensitive')
+                if dm not in DETECTION_MODES:
+                    dm = 'sensitive'
+                result = analyze_plate(image_bytes, media_type, dm)
                 return jsonify(result)
         
         return jsonify({
