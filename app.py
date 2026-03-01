@@ -36,7 +36,7 @@ PIPELINE_PARAMS = {
     'ladder_min_area': 6,
     'ladder_max_area': 6000,
     'ladder_min_circularity': 0.12,
-    'score_threshold_fraction': 0.18,
+    'score_threshold_fraction': 0.22,
     'watershed_footprint': 7,
     'watershed_min_distance': 2.0,
     'min_colony_area': 8,
@@ -55,7 +55,7 @@ MODE_SENSITIVITY = {
 def _adjust_params_for_sensitivity(sensitivity):
     """Adjust pipeline parameters based on sensitivity value in [0, 1]."""
     p = dict(PIPELINE_PARAMS)
-    p['score_threshold_fraction'] = 0.28 - 0.20 * sensitivity
+    p['score_threshold_fraction'] = 0.32 - 0.20 * sensitivity
     p['min_colony_area'] = int(14 - 8 * sensitivity)
     p['min_circularity'] = 0.35 - 0.13 * sensitivity
     return p
@@ -322,28 +322,18 @@ def split_touching_colonies(binary_mask, foreground, min_area=6):
     3. Merge both peak sources, Voronoi partition, label per territory
     """
     from scipy.ndimage import (distance_transform_edt, label,
-                               maximum_filter, find_objects,
-                               gaussian_filter)
+                               maximum_filter, find_objects)
 
     if np.sum(binary_mask) == 0:
         return np.zeros_like(binary_mask, dtype=np.int32), 0
 
     distance = distance_transform_edt(binary_mask)
 
-    # Distance-transform peaks
-    dt_local_max = maximum_filter(distance, size=6)
-    dist_peaks = (distance == dt_local_max) & (distance >= 1.8) & binary_mask
+    # Distance-transform peaks (EDT only — foreground intensity peaks over-split)
+    local_max = maximum_filter(distance, size=7)
+    peaks = (distance == local_max) & (distance >= 2.0) & binary_mask
 
-    # Foreground intensity peaks — catches colonies the EDT misses
-    fg_smooth = gaussian_filter(foreground * binary_mask, sigma=1.5)
-    fg_local_max = maximum_filter(fg_smooth, size=6)
-    fg_vals = foreground[binary_mask]
-    fg_threshold = np.percentile(fg_vals, 55) if len(fg_vals) > 0 else 0
-    fg_peaks = (fg_smooth == fg_local_max) & (fg_smooth > fg_threshold) & binary_mask
-
-    # Merge both peak sources
-    all_peaks = dist_peaks | fg_peaks
-    markers, n_markers = label(all_peaks)
+    markers, n_markers = label(peaks)
 
     if n_markers <= 1:
         labeled, n_features = label(binary_mask)
