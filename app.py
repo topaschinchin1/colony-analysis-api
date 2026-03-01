@@ -35,8 +35,8 @@ PIPELINE_PARAMS = {
     'n_thresholds': 30,
     'ladder_min_area': 6,
     'ladder_max_area': 6000,
-    'ladder_min_circularity': 0.15,
-    'score_threshold_fraction': 0.30,
+    'ladder_min_circularity': 0.12,
+    'score_threshold_fraction': 0.18,
     'watershed_footprint': 7,
     'watershed_min_distance': 2.0,
     'min_colony_area': 8,
@@ -55,7 +55,7 @@ MODE_SENSITIVITY = {
 def _adjust_params_for_sensitivity(sensitivity):
     """Adjust pipeline parameters based on sensitivity value in [0, 1]."""
     p = dict(PIPELINE_PARAMS)
-    p['score_threshold_fraction'] = 0.40 - 0.20 * sensitivity
+    p['score_threshold_fraction'] = 0.28 - 0.20 * sensitivity
     p['min_colony_area'] = int(14 - 8 * sensitivity)
     p['min_circularity'] = 0.35 - 0.13 * sensitivity
     return p
@@ -231,7 +231,7 @@ def build_score_map(foreground, plate_mask, n_thresholds=30,
         return np.zeros_like(foreground, dtype=np.int32)
 
     t_high = np.percentile(fg_values, 95)
-    t_low = np.percentile(fg_values, 10)
+    t_low = np.percentile(fg_values, 5)
 
     if t_high <= t_low:
         t_high = fg_values.max()
@@ -284,10 +284,10 @@ def _auto_adjust_score_threshold(score_map, plate_mask, base_fraction):
         (score_map > 0.5 * max_score) & plate_mask
     ) / max(1, np.sum(plate_mask))
 
-    if high_score_fraction > 0.10:
-        return min(0.45, base_fraction + 0.08)
+    if high_score_fraction > 0.15:
+        return min(0.35, base_fraction + 0.05)
     elif high_score_fraction < 0.02:
-        return max(0.15, base_fraction - 0.08)
+        return max(0.10, base_fraction - 0.05)
 
     return base_fraction
 
