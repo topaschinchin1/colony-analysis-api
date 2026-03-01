@@ -36,7 +36,7 @@ PIPELINE_PARAMS = {
     'ladder_min_area': 6,
     'ladder_max_area': 6000,
     'ladder_min_circularity': 0.12,
-    'score_threshold_fraction': 0.20,
+    'score_threshold_fraction': 0.19,
     'watershed_footprint': 7,
     'watershed_min_distance': 2.0,
     'min_colony_area': 8,
@@ -55,7 +55,7 @@ MODE_SENSITIVITY = {
 def _adjust_params_for_sensitivity(sensitivity):
     """Adjust pipeline parameters based on sensitivity value in [0, 1]."""
     p = dict(PIPELINE_PARAMS)
-    p['score_threshold_fraction'] = 0.30 - 0.20 * sensitivity
+    p['score_threshold_fraction'] = 0.29 - 0.20 * sensitivity
     p['min_colony_area'] = int(14 - 8 * sensitivity)
     p['min_circularity'] = 0.35 - 0.13 * sensitivity
     return p
@@ -396,7 +396,7 @@ def split_touching_colonies(binary_mask, foreground, min_area=6):
         if area < min_area:
             continue
 
-        if area > 300:
+        if area > 250:
             # Try foreground peak splitting on this oversized segment
             local_fg = fg_smooth[slc] * seg_mask
             fg_local_max = maximum_filter(local_fg, size=9)
