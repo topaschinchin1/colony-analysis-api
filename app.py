@@ -36,7 +36,7 @@ PIPELINE_PARAMS = {
     'ladder_min_area': 6,
     'ladder_max_area': 6000,
     'ladder_min_circularity': 0.12,
-    'score_threshold_fraction': 0.22,
+    'score_threshold_fraction': 0.20,
     'watershed_footprint': 7,
     'watershed_min_distance': 2.0,
     'min_colony_area': 8,
@@ -55,7 +55,7 @@ MODE_SENSITIVITY = {
 def _adjust_params_for_sensitivity(sensitivity):
     """Adjust pipeline parameters based on sensitivity value in [0, 1]."""
     p = dict(PIPELINE_PARAMS)
-    p['score_threshold_fraction'] = 0.32 - 0.20 * sensitivity
+    p['score_threshold_fraction'] = 0.30 - 0.20 * sensitivity
     p['min_colony_area'] = int(14 - 8 * sensitivity)
     p['min_circularity'] = 0.35 - 0.13 * sensitivity
     return p
@@ -312,41 +312,15 @@ def extract_colonies_from_score_map(score_map, plate_mask,
 
 # === STEP 4: PROPER WATERSHED SPLITTING ===
 
-def split_touching_colonies(binary_mask, foreground, min_area=6):
-    """
-    Split touching colonies using dual peak detection and Voronoi partitioning.
+def _voronoi_split(binary_mask, markers, n_markers, min_area):
+    """Voronoi partition by markers, then label connected components per territory."""
+    from scipy.ndimage import distance_transform_edt, label, find_objects
 
-    1. Distance-transform peaks (colony shape centers)
-    2. Foreground intensity peaks (brightness centers — catches merged
-       blobs where the EDT has only one peak but two brightness maxima)
-    3. Merge both peak sources, Voronoi partition, label per territory
-    """
-    from scipy.ndimage import (distance_transform_edt, label,
-                               maximum_filter, find_objects)
-
-    if np.sum(binary_mask) == 0:
-        return np.zeros_like(binary_mask, dtype=np.int32), 0
-
-    distance = distance_transform_edt(binary_mask)
-
-    # Distance-transform peaks (EDT only — foreground intensity peaks over-split)
-    local_max = maximum_filter(distance, size=7)
-    peaks = (distance == local_max) & (distance >= 2.0) & binary_mask
-
-    markers, n_markers = label(peaks)
-
-    if n_markers <= 1:
-        labeled, n_features = label(binary_mask)
-        return labeled.astype(np.int32), n_features
-
-    # Voronoi partition: assign each pixel to its nearest marker
-    # using EDT of the inverted marker mask with return_indices
     marker_mask = (markers > 0)
     _, nearest_idx = distance_transform_edt(~marker_mask, return_indices=True)
     nearest_label = markers[nearest_idx[0], nearest_idx[1]]
     segmented = np.where(binary_mask, nearest_label, 0).astype(np.int32)
 
-    # Label each marker territory's connected components separately
     slices = find_objects(segmented)
     if not slices:
         labeled, n_features = label(binary_mask)
@@ -370,6 +344,77 @@ def split_touching_colonies(binary_mask, foreground, min_area=6):
 
     if next_id == 0:
         labeled, n_features = label(binary_mask)
+        return labeled.astype(np.int32), n_features
+
+    return output, next_id
+
+
+def split_touching_colonies(binary_mask, foreground, min_area=6):
+    """
+    Two-pass colony splitting:
+    Pass 1: EDT peaks with Voronoi partition (standard splitting)
+    Pass 2: For oversized segments (>300px), apply conservative foreground
+            intensity peaks (footprint 9, 70th percentile) to split only
+            the most obvious merged clusters.
+    """
+    from scipy.ndimage import (distance_transform_edt, label,
+                               maximum_filter, find_objects,
+                               gaussian_filter)
+
+    if np.sum(binary_mask) == 0:
+        return np.zeros_like(binary_mask, dtype=np.int32), 0
+
+    distance = distance_transform_edt(binary_mask)
+
+    # Pass 1: EDT peaks
+    local_max = maximum_filter(distance, size=7)
+    peaks = (distance == local_max) & (distance >= 2.0) & binary_mask
+    markers, n_markers = label(peaks)
+
+    if n_markers <= 1:
+        labeled, n_features = label(binary_mask)
+    else:
+        labeled, n_features = _voronoi_split(binary_mask, markers, n_markers, min_area)
+
+    # Pass 2: split oversized segments using conservative foreground peaks
+    fg_smooth = gaussian_filter(foreground * binary_mask, sigma=1.5)
+    fg_vals = foreground[binary_mask]
+    fg_threshold = np.percentile(fg_vals, 70) if len(fg_vals) > 0 else 0
+
+    slices = find_objects(labeled)
+    if not slices:
+        return labeled.astype(np.int32), n_features
+
+    output = np.zeros_like(labeled)
+    next_id = 0
+
+    for i, slc in enumerate(slices):
+        if slc is None:
+            continue
+        seg_mask = (labeled[slc] == (i + 1))
+        area = int(np.sum(seg_mask))
+        if area < min_area:
+            continue
+
+        if area > 300:
+            # Try foreground peak splitting on this oversized segment
+            local_fg = fg_smooth[slc] * seg_mask
+            fg_local_max = maximum_filter(local_fg, size=9)
+            fg_peaks = (local_fg == fg_local_max) & (local_fg > fg_threshold) & seg_mask
+            sub_markers, n_sub_markers = label(fg_peaks)
+
+            if n_sub_markers >= 2:
+                sub_split, n_sub = _voronoi_split(seg_mask, sub_markers, n_sub_markers, min_area)
+                for k in range(1, n_sub + 1):
+                    next_id += 1
+                    output[slc][sub_split == k] = next_id
+                continue
+
+        # Keep segment as-is
+        next_id += 1
+        output[slc][seg_mask] = next_id
+
+    if next_id == 0:
         return labeled.astype(np.int32), n_features
 
     return output, next_id
