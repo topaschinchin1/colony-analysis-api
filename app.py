@@ -31,7 +31,7 @@ DETECTION_MODES = ['sensitive', 'strict', 'auto']
 
 # Unified pipeline parameters
 PIPELINE_PARAMS = {
-    'bg_sigma_fraction': 0.10,
+    'bg_sigma_fraction': 0.12,
     'n_thresholds': 30,
     'ladder_min_area': 6,
     'ladder_max_area': 6000,
@@ -330,15 +330,15 @@ def split_touching_colonies(binary_mask, foreground, min_area=6):
 
     distance = distance_transform_edt(binary_mask)
 
-    # Distance-transform peaks — tighter footprint to catch close colonies
-    dt_local_max = maximum_filter(distance, size=5)
-    dist_peaks = (distance == dt_local_max) & (distance >= 1.5) & binary_mask
+    # Distance-transform peaks
+    dt_local_max = maximum_filter(distance, size=6)
+    dist_peaks = (distance == dt_local_max) & (distance >= 1.8) & binary_mask
 
     # Foreground intensity peaks — catches colonies the EDT misses
     fg_smooth = gaussian_filter(foreground * binary_mask, sigma=1.5)
-    fg_local_max = maximum_filter(fg_smooth, size=5)
+    fg_local_max = maximum_filter(fg_smooth, size=6)
     fg_vals = foreground[binary_mask]
-    fg_threshold = np.percentile(fg_vals, 40) if len(fg_vals) > 0 else 0
+    fg_threshold = np.percentile(fg_vals, 55) if len(fg_vals) > 0 else 0
     fg_peaks = (fg_smooth == fg_local_max) & (fg_smooth > fg_threshold) & binary_mask
 
     # Merge both peak sources
