@@ -31,7 +31,7 @@ DETECTION_MODES = ['sensitive', 'strict', 'auto']
 
 # Unified pipeline parameters
 PIPELINE_PARAMS = {
-    'bg_sigma_fraction': 0.15,
+    'bg_sigma_fraction': 0.10,
     'n_thresholds': 30,
     'ladder_min_area': 6,
     'ladder_max_area': 6000,
@@ -314,26 +314,36 @@ def extract_colonies_from_score_map(score_map, plate_mask,
 
 def split_touching_colonies(binary_mask, foreground, min_area=6):
     """
-    Split touching colonies using distance-transform markers and
-    Voronoi partitioning via distance_transform_edt.
+    Split touching colonies using dual peak detection and Voronoi partitioning.
 
-    1. Distance transform to find colony centers (local maxima)
-    2. Voronoi partition assigns each foreground pixel to nearest marker
-    3. Label connected components within each marker's territory
+    1. Distance-transform peaks (colony shape centers)
+    2. Foreground intensity peaks (brightness centers — catches merged
+       blobs where the EDT has only one peak but two brightness maxima)
+    3. Merge both peak sources, Voronoi partition, label per territory
     """
     from scipy.ndimage import (distance_transform_edt, label,
-                               maximum_filter, find_objects)
+                               maximum_filter, find_objects,
+                               gaussian_filter)
 
     if np.sum(binary_mask) == 0:
         return np.zeros_like(binary_mask, dtype=np.int32), 0
 
     distance = distance_transform_edt(binary_mask)
 
-    footprint_size = 7
-    local_max = maximum_filter(distance, size=footprint_size)
-    peaks = (distance == local_max) & (distance >= 2.0) & binary_mask
+    # Distance-transform peaks — tighter footprint to catch close colonies
+    dt_local_max = maximum_filter(distance, size=5)
+    dist_peaks = (distance == dt_local_max) & (distance >= 1.5) & binary_mask
 
-    markers, n_markers = label(peaks)
+    # Foreground intensity peaks — catches colonies the EDT misses
+    fg_smooth = gaussian_filter(foreground * binary_mask, sigma=1.5)
+    fg_local_max = maximum_filter(fg_smooth, size=5)
+    fg_vals = foreground[binary_mask]
+    fg_threshold = np.percentile(fg_vals, 40) if len(fg_vals) > 0 else 0
+    fg_peaks = (fg_smooth == fg_local_max) & (fg_smooth > fg_threshold) & binary_mask
+
+    # Merge both peak sources
+    all_peaks = dist_peaks | fg_peaks
+    markers, n_markers = label(all_peaks)
 
     if n_markers <= 1:
         labeled, n_features = label(binary_mask)
