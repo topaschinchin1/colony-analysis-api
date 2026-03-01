@@ -314,13 +314,15 @@ def extract_colonies_from_score_map(score_map, plate_mask,
 
 def split_touching_colonies(binary_mask, foreground, min_area=6):
     """
-    Split touching colonies using scipy.ndimage.watershed_ift on the
-    inverted distance transform. Real priority-queue flooding from
-    distance-transform peaks, not nearest-neighbor Voronoi.
+    Split touching colonies using distance-transform markers and
+    Voronoi partitioning via distance_transform_edt.
+
+    1. Distance transform to find colony centers (local maxima)
+    2. Voronoi partition assigns each foreground pixel to nearest marker
+    3. Label connected components within each marker's territory
     """
     from scipy.ndimage import (distance_transform_edt, label,
-                               maximum_filter, watershed_ift,
-                               find_objects)
+                               maximum_filter, find_objects)
 
     if np.sum(binary_mask) == 0:
         return np.zeros_like(binary_mask, dtype=np.int32), 0
@@ -337,36 +339,40 @@ def split_touching_colonies(binary_mask, foreground, min_area=6):
         labeled, n_features = label(binary_mask)
         return labeled.astype(np.int32), n_features
 
-    max_dist = distance.max()
-    if max_dist == 0:
-        max_dist = 1.0
-    inv_distance = ((max_dist - distance) / max_dist * 65534).astype(np.uint16)
-    inv_distance[~binary_mask] = 65535
+    # Voronoi partition: assign each pixel to its nearest marker
+    # using EDT of the inverted marker mask with return_indices
+    marker_mask = (markers > 0)
+    _, nearest_idx = distance_transform_edt(~marker_mask, return_indices=True)
+    nearest_label = markers[nearest_idx[0], nearest_idx[1]]
+    segmented = np.where(binary_mask, nearest_label, 0).astype(np.int32)
 
-    ws_markers = np.zeros_like(binary_mask, dtype=np.int32)
-    ws_markers[markers > 0] = markers[markers > 0]
-    ws_markers[~binary_mask] = -1
-
-    segmented = watershed_ift(inv_distance, ws_markers)
-    segmented[~binary_mask] = 0
-
-    # Re-label and remove tiny fragments
+    # Label each marker territory's connected components separately
     slices = find_objects(segmented)
-    if slices is None:
+    if not slices:
         labeled, n_features = label(binary_mask)
         return labeled.astype(np.int32), n_features
 
-    cleaned = np.zeros_like(segmented)
-    new_label = 0
+    output = np.zeros_like(binary_mask, dtype=np.int32)
+    next_id = 0
+
     for i, slc in enumerate(slices):
         if slc is None:
             continue
-        component = (segmented[slc] == (i + 1))
-        if np.sum(component) >= min_area:
-            new_label += 1
-            cleaned[slc][component] = new_label
+        region = (segmented[slc] == (i + 1))
+        if not np.any(region):
+            continue
+        sub_labeled, n_sub = label(region)
+        for j in range(1, n_sub + 1):
+            component = (sub_labeled == j)
+            if int(np.sum(component)) >= min_area:
+                next_id += 1
+                output[slc][component] = next_id
 
-    return cleaned, new_label
+    if next_id == 0:
+        labeled, n_features = label(binary_mask)
+        return labeled.astype(np.int32), n_features
+
+    return output, next_id
 
 
 # === STEP 5: ROBUST CIRCULARITY AND FILTERING ===
@@ -688,7 +694,7 @@ def health():
             'Local background subtraction (large Gaussian)',
             'Threshold ladder with score-map accumulation (OpenCFU)',
             'Auto-adaptive score threshold',
-            'Watershed splitting (scipy watershed_ift)',
+            'Voronoi colony splitting (distance-transform markers)',
             'Robust circularity filtering (moments + Cauchy-Crofton)',
             'HSV hemolysis classification'
         ]
