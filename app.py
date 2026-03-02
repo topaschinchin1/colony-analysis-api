@@ -28,6 +28,7 @@ app = Flask(__name__)
 MAX_IMAGE_SIZE = 800
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
 DETECTION_MODES = ['sensitive', 'strict', 'auto']
+COLONY_SIZES = ['small', 'medium', 'large', 'auto']
 
 # Unified pipeline parameters
 PIPELINE_PARAMS = {
@@ -52,12 +53,25 @@ MODE_SENSITIVITY = {
 }
 
 
-def _adjust_params_for_sensitivity(sensitivity):
-    """Adjust pipeline parameters based on sensitivity value in [0, 1]."""
+def _adjust_params_for_sensitivity(sensitivity, colony_size='auto'):
+    """Adjust pipeline parameters based on sensitivity and colony_size hint."""
     p = dict(PIPELINE_PARAMS)
     p['score_threshold_fraction'] = 0.29 - 0.20 * sensitivity
     p['min_colony_area'] = int(14 - 8 * sensitivity)
     p['min_circularity'] = 0.35 - 0.13 * sensitivity
+    p['oversized_segment_threshold'] = 250
+    p['plate_radius_factor'] = 0.88
+
+    if colony_size == 'small':
+        p['min_colony_area'] = max(3, int(p['min_colony_area'] * 0.6))
+        p['score_threshold_fraction'] = max(0.05, p['score_threshold_fraction'] - 0.03)
+        p['oversized_segment_threshold'] = 150
+        p['plate_radius_factor'] = 0.93
+    elif colony_size == 'large':
+        p['min_colony_area'] = int(p['min_colony_area'] * 1.3)
+        p['score_threshold_fraction'] = p['score_threshold_fraction'] + 0.02
+        p['oversized_segment_threshold'] = 400
+
     return p
 
 
@@ -135,7 +149,7 @@ def detect_plate_region(rgb_array):
     return agar_mask
 
 
-def create_plate_mask(shape, rgb_array=None):
+def create_plate_mask(shape, rgb_array=None, radius_factor=0.88):
     """Create plate mask combining circular and color detection"""
     h, w = shape[:2]
     center_y, center_x = h // 2, w // 2
@@ -143,7 +157,7 @@ def create_plate_mask(shape, rgb_array=None):
 
     y, x = np.ogrid[:h, :w]
     dist = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
-    circular_mask = dist <= radius * 0.88
+    circular_mask = dist <= radius * radius_factor
 
     if rgb_array is not None:
         color_mask = detect_plate_region(rgb_array)
@@ -349,13 +363,14 @@ def _voronoi_split(binary_mask, markers, n_markers, min_area):
     return output, next_id
 
 
-def split_touching_colonies(binary_mask, foreground, min_area=6):
+def split_touching_colonies(binary_mask, foreground, min_area=6,
+                            oversized_threshold=250):
     """
     Two-pass colony splitting:
     Pass 1: EDT peaks with Voronoi partition (standard splitting)
-    Pass 2: For oversized segments (>300px), apply conservative foreground
-            intensity peaks (footprint 9, 70th percentile) to split only
-            the most obvious merged clusters.
+    Pass 2: For oversized segments (>oversized_threshold px), apply
+            conservative foreground intensity peaks (footprint 9, 70th
+            percentile) to split only the most obvious merged clusters.
     """
     from scipy.ndimage import (distance_transform_edt, label,
                                maximum_filter, find_objects,
@@ -396,7 +411,7 @@ def split_touching_colonies(binary_mask, foreground, min_area=6):
         if area < min_area:
             continue
 
-        if area > 250:
+        if area > oversized_threshold:
             # Try foreground peak splitting on this oversized segment
             local_fg = fg_smooth[slc] * seg_mask
             fg_local_max = maximum_filter(local_fg, size=9)
@@ -512,17 +527,18 @@ def filter_colonies(labeled, min_area, max_area, min_circularity):
 
 # === MAIN DETECTION PIPELINE ===
 
-def colony_detection_opencfu(rgb_array, luminance, plate_mask, sensitivity=0.5):
+def colony_detection_opencfu(rgb_array, luminance, plate_mask,
+                             sensitivity=0.5, colony_size='auto'):
     """
     OpenCFU-inspired colony detection pipeline.
 
     1. Compute foreground signal (background subtraction)
     2. Build score map (threshold ladder)
     3. Extract binary colony mask from score map
-    4. Split touching colonies (watershed_ift)
+    4. Split touching colonies (Voronoi + oversized pass)
     5. Filter by size and circularity
     """
-    params = _adjust_params_for_sensitivity(sensitivity)
+    params = _adjust_params_for_sensitivity(sensitivity, colony_size)
 
     # Step 1: Background subtraction
     foreground = compute_foreground_signal(rgb_array, plate_mask)
@@ -552,7 +568,8 @@ def colony_detection_opencfu(rgb_array, luminance, plate_mask, sensitivity=0.5):
     # Step 4: Split touching colonies
     labeled, n_segments = split_touching_colonies(
         binary_mask, foreground,
-        min_area=params['min_colony_area']
+        min_area=params['min_colony_area'],
+        oversized_threshold=params['oversized_segment_threshold']
     )
 
     # Step 5: Filter by size and circularity
@@ -569,6 +586,7 @@ def colony_detection_opencfu(rgb_array, luminance, plate_mask, sensitivity=0.5):
     debug_info = {
         'algorithm': 'opencfu_ladder_v1.8.0',
         'sensitivity': round(sensitivity, 2),
+        'colony_size': colony_size,
         'n_thresholds': params['n_thresholds'],
         'score_threshold_used': round(score_frac, 3),
         'score_map_max': int(score_map.max()),
@@ -682,16 +700,19 @@ def generate_decision(colony_count, hemolysis, media_type):
 
 # === MAIN ANALYSIS ===
 
-def analyze_plate(image_bytes, media_type='blood_agar', detection_mode='sensitive'):
+def analyze_plate(image_bytes, media_type='blood_agar', detection_mode='sensitive',
+                  colony_size='auto'):
     """Main analysis function - v1.8.0 OpenCFU pipeline"""
     img = load_and_resize_image(image_bytes)
-    plate_mask, center, radius = create_plate_mask(img.shape, rgb_array=img)
+    sensitivity = MODE_SENSITIVITY.get(detection_mode, 0.5)
+    params = _adjust_params_for_sensitivity(sensitivity, colony_size)
+    plate_mask, center, radius = create_plate_mask(
+        img.shape, rgb_array=img, radius_factor=params['plate_radius_factor']
+    )
     luminance = get_luminance(img)
 
-    sensitivity = MODE_SENSITIVITY.get(detection_mode, 0.5)
-
     colony_count, avg_size, avg_circ, labeled, debug_info = colony_detection_opencfu(
-        img, luminance, plate_mask, sensitivity=sensitivity
+        img, luminance, plate_mask, sensitivity=sensitivity, colony_size=colony_size
     )
 
     hemolysis = detect_hemolysis_hsv(img, plate_mask)
@@ -701,6 +722,7 @@ def analyze_plate(image_bytes, media_type='blood_agar', detection_mode='sensitiv
         'status': 'success',
         'colony_count': colony_count,
         'detection_mode': detection_mode,
+        'colony_size': colony_size,
         'decision_label': decision['label'],
         'decision_confidence': decision['confidence'],
         'requires_manual_review': decision['requires_review'],
@@ -735,6 +757,12 @@ def health():
             'strict': 'Higher specificity (filters aggressively)',
             'auto': 'Balanced auto-adaptive detection'
         },
+        'colony_sizes': {
+            'small': 'Tiny colonies (~45px avg) — lower thresholds, wider plate mask',
+            'medium': 'Standard colonies — default parameters',
+            'large': 'Large colonies — stricter filtering, higher split threshold',
+            'auto': 'Auto-adaptive (default)'
+        },
         'algorithms': [
             'Local background subtraction (large Gaussian)',
             'Threshold ladder with score-map accumulation (OpenCFU)',
@@ -768,11 +796,15 @@ def analyze():
         if detection_mode not in DETECTION_MODES:
             detection_mode = 'sensitive'
 
+        colony_size = request.form.get('colony_size', 'auto')
+        if colony_size not in COLONY_SIZES:
+            colony_size = 'auto'
+
         if 'image' in request.files:
             file = request.files['image']
             if file and file.filename:
                 image_bytes = file.read()
-                result = analyze_plate(image_bytes, media_type, detection_mode)
+                result = analyze_plate(image_bytes, media_type, detection_mode, colony_size)
                 return jsonify(result)
 
         if request.is_json:
@@ -782,7 +814,10 @@ def analyze():
                 dm = data.get('detection_mode', 'sensitive')
                 if dm not in DETECTION_MODES:
                     dm = 'sensitive'
-                result = analyze_plate(image_bytes, media_type, dm)
+                cs = data.get('colony_size', 'auto')
+                if cs not in COLONY_SIZES:
+                    cs = 'auto'
+                result = analyze_plate(image_bytes, media_type, dm, cs)
                 return jsonify(result)
 
         return jsonify({
