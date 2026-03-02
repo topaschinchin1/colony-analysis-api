@@ -31,7 +31,7 @@ DETECTION_MODES = ['sensitive', 'strict', 'auto']
 
 # Unified pipeline parameters
 PIPELINE_PARAMS = {
-    'bg_sigma_fraction': 0.12,
+    'bg_sigma_fraction': 0.08,
     'n_thresholds': 30,
     'ladder_min_area': 6,
     'ladder_max_area': 6000,
@@ -230,8 +230,8 @@ def build_score_map(foreground, plate_mask, n_thresholds=30,
     if len(fg_values) == 0:
         return np.zeros_like(foreground, dtype=np.int32)
 
-    t_high = np.percentile(fg_values, 95)
-    t_low = np.percentile(fg_values, 5)
+    t_high = np.percentile(fg_values, 97)
+    t_low = np.percentile(fg_values, 2)
 
     if t_high <= t_low:
         t_high = fg_values.max()
