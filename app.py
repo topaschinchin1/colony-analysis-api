@@ -710,11 +710,12 @@ def analyze_plate(image_bytes, media_type='blood_agar', detection_mode='sensitiv
         img.shape, rgb_array=img, radius_factor=params['plate_radius_factor']
     )
 
-    # Safety net: if color mask excluded too much, fall back to geometry-only circle
+    # Safety net: if plate coverage is too low, expand radius by 10%
     plate_coverage = np.sum(plate_mask) / (img.shape[0] * img.shape[1])
     if plate_coverage < 0.50:
+        expanded_factor = min(params['plate_radius_factor'] * 1.10, 0.98)
         plate_mask, center, radius = create_plate_mask(
-            img.shape, rgb_array=None, radius_factor=params['plate_radius_factor']
+            img.shape, rgb_array=img, radius_factor=expanded_factor
         )
 
     luminance = get_luminance(img)
