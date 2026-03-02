@@ -19,10 +19,12 @@ import traceback
 import base64
 from io import BytesIO
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import numpy as np
 from PIL import Image
 
 app = Flask(__name__)
+CORS(app)
 
 # Configuration
 MAX_IMAGE_SIZE = 800
