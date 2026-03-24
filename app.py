@@ -1,6 +1,6 @@
 """
 Colony Counting and Hemolysis Detection API
-Version: 1.9.1 - OpenCFU-inspired pipeline with density-channel architecture
+Version: 1.9.2 - OpenCFU-inspired pipeline with density-channel architecture
 
 Algorithm based on OpenCFU (Geissmann 2013, PLOS ONE):
 1. Local background subtraction (large Gaussian) — handles uneven illumination
@@ -15,9 +15,10 @@ algorithm is the same regardless of mode.
 
 v1.9.1 changes:
 - Density-channel architecture: LOW / MEDIUM / HIGH channels with independent params
-- LOW channel: v1.8.0 thresholds, 250px watershed, edge/center noise filter, min_circ 0.40
+- LOW channel: hardcoded 0.19 threshold, 250px watershed, edge/center/contrast noise filter, min_circ 0.40
 - MEDIUM channel: v1.9.0 settings preserved (0.85 threshold, 80px watershed)
 - HIGH channel: unchanged from v1.9.0
+v1.9.2: LOW channel tuning — hardcode score_threshold 0.19, undersized 40% median, contrast filter 15 lum units
 """
 
 import os
@@ -564,30 +565,33 @@ def filter_colonies(labeled, min_area, max_area, min_circularity):
 
 # === LOW-DENSITY NOISE FILTER ===
 
-def _filter_edge_and_center_noise(labeled, plate_mask, center, radius, colony_sizes_px):
+def _filter_edge_and_center_noise(labeled, plate_mask, center, radius, colony_sizes_px,
+                                   luminance=None):
     """
     Post-detection noise filter for low-density plates.
     Rejects detections that are:
     - Within 20px of plate edge
     - Within center 15% of plate (where label text sits)
-    - Below 60% of median colony size
+    - Below 40% of median colony size
+    - Low contrast: luminance difference between colony and 5px surround < 15 units
     Returns (labeled, count, sizes, circs, rejection_counts).
     """
-    from scipy.ndimage import find_objects
+    from scipy.ndimage import find_objects, binary_dilation
 
     rejected_edge = 0
     rejected_center = 0
     rejected_undersized = 0
+    rejected_contrast = 0
 
     if labeled.max() == 0 or not colony_sizes_px:
-        return labeled, 0, [], [], {'edge': 0, 'center': 0, 'undersized': 0}
+        return labeled, 0, [], [], {'edge': 0, 'center': 0, 'undersized': 0, 'contrast': 0}
 
     cx, cy = center
     median_size = float(np.median(colony_sizes_px))
-    min_size_threshold = median_size * 0.60
+    min_size_threshold = median_size * 0.40
 
     logger.info("[COLONY-DEBUG] Noise filter params: median_size=%.1f, "
-                "min_size_threshold=%.1f, radius=%d, center=(%d,%d)",
+                "min_size_threshold=%.1f (40%% median), radius=%d, center=(%d,%d)",
                 median_size, min_size_threshold, radius, cx, cy)
 
     slices = find_objects(labeled)
@@ -625,10 +629,44 @@ def _filter_edge_and_center_noise(labeled, plate_mask, center, radius, colony_si
             rejected_center += 1
             continue
 
-        # Reject if below 60% of median colony size
+        # Reject if below 40% of median colony size
         if area < min_size_threshold:
             rejected_undersized += 1
             continue
+
+        # Contrast filter: colony vs 5px surrounding ring must differ by >= 15 lum units
+        if luminance is not None:
+            # Expand slice bounds by 5px for the surrounding ring
+            pad = 5
+            h_img, w_img = luminance.shape
+            y_start = max(0, slc[0].start - pad)
+            y_stop = min(h_img, slc[0].stop + pad)
+            x_start = max(0, slc[1].start - pad)
+            x_stop = min(w_img, slc[1].stop + pad)
+            expanded_slc = (slice(y_start, y_stop), slice(x_start, x_stop))
+
+            # Place component in expanded frame
+            comp_in_expanded = np.zeros((y_stop - y_start, x_stop - x_start), dtype=bool)
+            cy_off = slc[0].start - y_start
+            cx_off = slc[1].start - x_start
+            comp_h, comp_w = component.shape
+            comp_in_expanded[cy_off:cy_off + comp_h, cx_off:cx_off + comp_w] = component
+
+            # 5px dilation ring minus the colony itself
+            dilated = binary_dilation(comp_in_expanded, iterations=pad)
+            ring = dilated & ~comp_in_expanded
+
+            lum_patch = luminance[expanded_slc]
+            colony_lum = float(np.mean(lum_patch[comp_in_expanded]))
+            ring_pixels = lum_patch[ring]
+            if len(ring_pixels) > 0:
+                surround_lum = float(np.mean(ring_pixels))
+                contrast = abs(colony_lum - surround_lum)
+                logger.info("[COLONY-DEBUG] Colony #%d: area=%d, contrast=%.1f (colony_lum=%.1f, surround=%.1f)",
+                            i + 1, area, contrast, colony_lum, surround_lum)
+                if contrast < 15.0:
+                    rejected_contrast += 1
+                    continue
 
         circ = calculate_circularity_robust(component)
         count += 1
@@ -636,7 +674,8 @@ def _filter_edge_and_center_noise(labeled, plate_mask, center, radius, colony_si
         kept_sizes.append(area)
         kept_circs.append(circ)
 
-    rejections = {'edge': rejected_edge, 'center': rejected_center, 'undersized': rejected_undersized}
+    rejections = {'edge': rejected_edge, 'center': rejected_center,
+                  'undersized': rejected_undersized, 'contrast': rejected_contrast}
     return output, count, kept_sizes, kept_circs, rejections
 
 
@@ -678,8 +717,8 @@ def colony_detection_opencfu(rgb_array, luminance, plate_mask,
 
     # Step 4: Channel-specific parameters
     if density_channel == 'LOW':
-        # v1.8.0 original thresholds — no reduction, conservative splitting
-        score_frac = params['score_threshold_fraction']  # unchanged base (0.19 range)
+        # Hardcoded v1.8.0 value — sensitivity must NOT lower this for sparse plates
+        score_frac = 0.19
         oversized_threshold = 250  # original v1.8.0 value
         min_circularity = 0.40  # stricter — noise specks are irregular
     elif density_channel == 'MEDIUM':
@@ -719,14 +758,15 @@ def colony_detection_opencfu(rgb_array, luminance, plate_mask,
 
     logger.info("[COLONY-DEBUG] raw_count_before_noise_filter=%d", colony_count)
 
-    # Step 8: Low-density post-filter (edge, center, runt noise)
+    # Step 8: Low-density post-filter (edge, center, runt, contrast noise)
     noise_rejected = 0
-    rejection_details = {'edge': 0, 'center': 0, 'undersized': 0}
+    rejection_details = {'edge': 0, 'center': 0, 'undersized': 0, 'contrast': 0}
     if density_channel == 'LOW' and colony_count > 0 and plate_center is not None:
         pre_filter_count = colony_count
         labeled, colony_count, colony_sizes, colony_circs, rejection_details = (
             _filter_edge_and_center_noise(
-                labeled, plate_mask, plate_center, plate_radius, colony_sizes
+                labeled, plate_mask, plate_center, plate_radius, colony_sizes,
+                luminance=luminance
             )
         )
         noise_rejected = pre_filter_count - colony_count
@@ -734,13 +774,14 @@ def colony_detection_opencfu(rgb_array, luminance, plate_mask,
     logger.info("[COLONY-DEBUG] noise_rejected_edge=%d", rejection_details['edge'])
     logger.info("[COLONY-DEBUG] noise_rejected_center=%d", rejection_details['center'])
     logger.info("[COLONY-DEBUG] noise_rejected_undersized=%d", rejection_details['undersized'])
+    logger.info("[COLONY-DEBUG] noise_rejected_contrast=%d", rejection_details['contrast'])
     logger.info("[COLONY-DEBUG] final_colony_count=%d", colony_count)
 
     avg_size = float(np.mean(colony_sizes)) if colony_sizes else 0.0
     avg_circ = float(np.mean(colony_circs)) if colony_circs else 0.0
 
     debug_info = {
-        'algorithm': 'opencfu_ladder_v1.9.1',
+        'algorithm': 'opencfu_ladder_v1.9.2',
         'density_channel': density_channel,
         'high_score_fraction': round(high_score_frac, 4),
         'sensitivity': round(sensitivity, 2),
@@ -920,7 +961,7 @@ def _run_analysis(img, media_type, detection_mode, colony_size):
             'plate_coverage_pct': round(100 * plate_coverage, 1)
         },
         'debug': debug_info,
-        'version': '1.9.1'
+        'version': '1.9.2'
     }
 
 
@@ -947,7 +988,7 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.9.1',
+        'version': '1.9.2',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'detection_modes': {
@@ -977,7 +1018,7 @@ def warmup():
     """Warm-up endpoint"""
     return jsonify({
         'status': 'warm',
-        'version': '1.9.1',
+        'version': '1.9.2',
         'message': 'Service is ready for analysis'
     })
 
