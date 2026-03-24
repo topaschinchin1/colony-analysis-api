@@ -1,20 +1,27 @@
 """
 Colony Counting and Hemolysis Detection API
-Version: 1.8.0 - OpenCFU-inspired pipeline
+Version: 1.9.1 - OpenCFU-inspired pipeline with density-channel architecture
 
 Algorithm based on OpenCFU (Geissmann 2013, PLOS ONE):
 1. Local background subtraction (large Gaussian) — handles uneven illumination
 2. Threshold ladder with score-map accumulation — robust multi-level detection
-3. Colony extraction from score map with auto-adaptive threshold
-4. Proper watershed splitting (scipy.ndimage.watershed_ift on distance transform)
+3. Density pre-scan → route to LOW / MEDIUM / HIGH channel
+4. Channel-specific extraction, splitting, and filtering
 5. Robust circularity filtering (moments-based for small colonies)
 
 Detection mode ('sensitive', 'strict', 'auto') maps to a continuous
 sensitivity parameter [0, 1] that makes small adjustments. The core
 algorithm is the same regardless of mode.
+
+v1.9.1 changes:
+- Density-channel architecture: LOW / MEDIUM / HIGH channels with independent params
+- LOW channel: v1.8.0 thresholds, 250px watershed, edge/center noise filter, min_circ 0.40
+- MEDIUM channel: v1.9.0 settings preserved (0.85 threshold, 80px watershed)
+- HIGH channel: unchanged from v1.9.0
 """
 
 import os
+import logging
 import traceback
 import base64
 from io import BytesIO
@@ -23,11 +30,20 @@ from flask_cors import CORS
 import numpy as np
 from PIL import Image
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 CORS(app)
 
 # Configuration
-MAX_IMAGE_SIZE = 800
+MAX_IMAGE_SIZE = 1600
+FALLBACK_IMAGE_SIZE = 800
 SUPPORTED_MEDIA_TYPES = ['blood_agar', 'nutrient_agar', 'macconkey_agar']
 DETECTION_MODES = ['sensitive', 'strict', 'auto']
 COLONY_SIZES = ['small', 'medium', 'large', 'auto']
@@ -61,36 +77,40 @@ def _adjust_params_for_sensitivity(sensitivity, colony_size='auto'):
     p['score_threshold_fraction'] = 0.29 - 0.20 * sensitivity
     p['min_colony_area'] = int(14 - 8 * sensitivity)
     p['min_circularity'] = 0.35 - 0.13 * sensitivity
-    p['oversized_segment_threshold'] = 250
+    p['oversized_segment_threshold'] = 80
     p['plate_radius_factor'] = 0.88
 
     if colony_size == 'small':
         p['min_colony_area'] = max(3, int(p['min_colony_area'] * 0.6))
         p['score_threshold_fraction'] = max(0.05, p['score_threshold_fraction'] - 0.03)
-        p['oversized_segment_threshold'] = 150
+        p['oversized_segment_threshold'] = 60
         p['plate_radius_factor'] = 0.93
     elif colony_size == 'large':
         p['min_colony_area'] = int(p['min_colony_area'] * 1.3)
         p['score_threshold_fraction'] = p['score_threshold_fraction'] + 0.02
-        p['oversized_segment_threshold'] = 400
+        p['oversized_segment_threshold'] = 200
 
     return p
 
 
 # === IMAGE LOADING ===
 
-def load_and_resize_image(image_bytes):
+def load_and_resize_image(image_bytes, max_size=None):
     """Load image and resize to manageable size"""
+    if max_size is None:
+        max_size = MAX_IMAGE_SIZE
+
     img = Image.open(BytesIO(image_bytes))
 
     if img.mode != 'RGB':
         img = img.convert('RGB')
 
     w, h = img.size
-    if max(w, h) > MAX_IMAGE_SIZE:
-        scale = MAX_IMAGE_SIZE / max(w, h)
+    if max(w, h) > max_size:
+        scale = max_size / max(w, h)
         new_w, new_h = int(w * scale), int(h * scale)
         img = img.resize((new_w, new_h), Image.LANCZOS)
+        logger.info("Resized image from %dx%d to %dx%d (max_size=%d)", w, h, new_w, new_h, max_size)
 
     return np.array(img)
 
@@ -287,25 +307,25 @@ def build_score_map(foreground, plate_mask, n_thresholds=30,
 
 # === STEP 3: COLONY EXTRACTION FROM SCORE MAP ===
 
-def _auto_adjust_score_threshold(score_map, plate_mask, base_fraction):
+def _classify_density(score_map, plate_mask):
     """
-    Auto-adjust score threshold based on plate density.
-    Dense plates get higher threshold (to separate), sparse plates lower (to not miss).
+    Pre-scan to classify plate density into LOW / MEDIUM / HIGH.
+    Returns (channel_name, high_score_fraction).
     """
     max_score = score_map.max()
     if max_score == 0:
-        return base_fraction
+        return 'LOW', 0.0
 
-    high_score_fraction = np.sum(
+    high_score_fraction = float(np.sum(
         (score_map > 0.5 * max_score) & plate_mask
-    ) / max(1, np.sum(plate_mask))
+    )) / max(1, int(np.sum(plate_mask)))
 
     if high_score_fraction > 0.15:
-        return min(0.35, base_fraction + 0.05)
-    elif high_score_fraction < 0.02:
-        return max(0.10, base_fraction - 0.05)
-
-    return base_fraction
+        return 'HIGH', high_score_fraction
+    elif high_score_fraction >= 0.02:
+        return 'MEDIUM', high_score_fraction
+    else:
+        return 'LOW', high_score_fraction
 
 
 def extract_colonies_from_score_map(score_map, plate_mask,
@@ -422,10 +442,25 @@ def split_touching_colonies(binary_mask, foreground, min_area=6,
 
             if n_sub_markers >= 2:
                 sub_split, n_sub = _voronoi_split(seg_mask, sub_markers, n_sub_markers, min_area)
+
+                # Circularity check: if any fragment has circularity < 0.3,
+                # the split was bad — merge everything back as one colony
+                bad_split = False
                 for k in range(1, n_sub + 1):
-                    next_id += 1
-                    output[slc][sub_split == k] = next_id
-                continue
+                    fragment = (sub_split == k)
+                    frag_area = int(np.sum(fragment))
+                    if frag_area >= min_area:
+                        frag_circ = calculate_circularity_robust(fragment)
+                        if frag_circ < 0.3:
+                            bad_split = True
+                            break
+
+                if not bad_split:
+                    for k in range(1, n_sub + 1):
+                        next_id += 1
+                        output[slc][sub_split == k] = next_id
+                    continue
+                # else: fall through and keep segment as-is
 
         # Keep segment as-is
         next_id += 1
@@ -527,18 +562,96 @@ def filter_colonies(labeled, min_area, max_area, min_circularity):
     return filtered, count, sizes, circs
 
 
+# === LOW-DENSITY NOISE FILTER ===
+
+def _filter_edge_and_center_noise(labeled, plate_mask, center, radius, colony_sizes_px):
+    """
+    Post-detection noise filter for low-density plates.
+    Rejects detections that are:
+    - Within 20px of plate edge
+    - Within center 15% of plate (where label text sits)
+    - Below 60% of median colony size
+    Returns (labeled, count, sizes, circs, rejection_counts).
+    """
+    from scipy.ndimage import find_objects
+
+    rejected_edge = 0
+    rejected_center = 0
+    rejected_undersized = 0
+
+    if labeled.max() == 0 or not colony_sizes_px:
+        return labeled, 0, [], [], {'edge': 0, 'center': 0, 'undersized': 0}
+
+    cx, cy = center
+    median_size = float(np.median(colony_sizes_px))
+    min_size_threshold = median_size * 0.60
+
+    logger.info("[COLONY-DEBUG] Noise filter params: median_size=%.1f, "
+                "min_size_threshold=%.1f, radius=%d, center=(%d,%d)",
+                median_size, min_size_threshold, radius, cx, cy)
+
+    slices = find_objects(labeled)
+    output = np.zeros_like(labeled)
+    count = 0
+    kept_sizes = []
+    kept_circs = []
+
+    for i, slc in enumerate(slices):
+        if slc is None:
+            continue
+        component = (labeled[slc] == (i + 1))
+        area = int(np.sum(component))
+        if area == 0:
+            continue
+
+        # Compute centroid of this colony
+        ys, xs = np.where(component)
+        # Offset to global coordinates
+        global_y = ys + slc[0].start
+        global_x = xs + slc[1].start
+        centroid_y = np.mean(global_y)
+        centroid_x = np.mean(global_x)
+
+        # Distance from plate center
+        dist_from_center = np.sqrt((centroid_x - cx) ** 2 + (centroid_y - cy) ** 2)
+
+        # Reject if within 20px of plate edge
+        if radius > 0 and dist_from_center > (radius - 20):
+            rejected_edge += 1
+            continue
+
+        # Reject if within center 15% (label text zone)
+        if radius > 0 and dist_from_center < (radius * 0.15):
+            rejected_center += 1
+            continue
+
+        # Reject if below 60% of median colony size
+        if area < min_size_threshold:
+            rejected_undersized += 1
+            continue
+
+        circ = calculate_circularity_robust(component)
+        count += 1
+        output[slc][component] = count
+        kept_sizes.append(area)
+        kept_circs.append(circ)
+
+    rejections = {'edge': rejected_edge, 'center': rejected_center, 'undersized': rejected_undersized}
+    return output, count, kept_sizes, kept_circs, rejections
+
+
 # === MAIN DETECTION PIPELINE ===
 
 def colony_detection_opencfu(rgb_array, luminance, plate_mask,
-                             sensitivity=0.5, colony_size='auto'):
+                             sensitivity=0.5, colony_size='auto',
+                             plate_center=None, plate_radius=0):
     """
-    OpenCFU-inspired colony detection pipeline.
+    OpenCFU-inspired colony detection with density-channel routing.
 
     1. Compute foreground signal (background subtraction)
     2. Build score map (threshold ladder)
-    3. Extract binary colony mask from score map
-    4. Split touching colonies (Voronoi + oversized pass)
-    5. Filter by size and circularity
+    3. Density pre-scan → classify as LOW / MEDIUM / HIGH
+    4. Route to density-specific channel for extraction, splitting, filtering
     """
     params = _adjust_params_for_sensitivity(sensitivity, colony_size)
 
@@ -558,44 +671,90 @@ def colony_detection_opencfu(rgb_array, luminance, plate_mask,
         min_circularity=params['ladder_min_circularity']
     )
 
-    # Step 3: Extract colony mask
-    score_frac = params['score_threshold_fraction']
-    score_frac = _auto_adjust_score_threshold(score_map, plate_mask, score_frac)
+    # Step 3: Density pre-scan
+    density_channel, high_score_frac = _classify_density(score_map, plate_mask)
+    logger.info("[COLONY-DEBUG] high_score_fraction=%.6f", high_score_frac)
+    logger.info("[COLONY-DEBUG] channel_selected=%s", density_channel)
 
+    # Step 4: Channel-specific parameters
+    if density_channel == 'LOW':
+        # v1.8.0 original thresholds — no reduction, conservative splitting
+        score_frac = params['score_threshold_fraction']  # unchanged base (0.19 range)
+        oversized_threshold = 250  # original v1.8.0 value
+        min_circularity = 0.40  # stricter — noise specks are irregular
+    elif density_channel == 'MEDIUM':
+        # v1.9.0 settings — threshold reduction + aggressive splitting
+        score_frac = params['score_threshold_fraction'] * 0.85
+        oversized_threshold = params['oversized_segment_threshold']  # 80px
+        min_circularity = params['min_circularity']
+    else:  # HIGH
+        score_frac = min(0.35, params['score_threshold_fraction'] + 0.05)
+        oversized_threshold = params['oversized_segment_threshold']
+        min_circularity = params['min_circularity']
+
+    logger.info("[COLONY-DEBUG] score_threshold_fraction=%.4f", score_frac)
+    logger.info("[COLONY-DEBUG] watershed_split_trigger=%d", oversized_threshold)
+    logger.info("[COLONY-DEBUG] min_circularity=%.3f", min_circularity)
+
+    # Step 5: Extract colony mask
     binary_mask = extract_colonies_from_score_map(
         score_map, plate_mask,
         score_threshold_fraction=score_frac
     )
 
-    # Step 4: Split touching colonies
+    # Step 6: Split touching colonies
     labeled, n_segments = split_touching_colonies(
         binary_mask, foreground,
         min_area=params['min_colony_area'],
-        oversized_threshold=params['oversized_segment_threshold']
+        oversized_threshold=oversized_threshold
     )
 
-    # Step 5: Filter by size and circularity
+    # Step 7: Filter by size and circularity
     labeled, colony_count, colony_sizes, colony_circs = filter_colonies(
         labeled,
         min_area=params['min_colony_area'],
         max_area=params['max_colony_area'],
-        min_circularity=params['min_circularity']
+        min_circularity=min_circularity
     )
+
+    logger.info("[COLONY-DEBUG] raw_count_before_noise_filter=%d", colony_count)
+
+    # Step 8: Low-density post-filter (edge, center, runt noise)
+    noise_rejected = 0
+    rejection_details = {'edge': 0, 'center': 0, 'undersized': 0}
+    if density_channel == 'LOW' and colony_count > 0 and plate_center is not None:
+        pre_filter_count = colony_count
+        labeled, colony_count, colony_sizes, colony_circs, rejection_details = (
+            _filter_edge_and_center_noise(
+                labeled, plate_mask, plate_center, plate_radius, colony_sizes
+            )
+        )
+        noise_rejected = pre_filter_count - colony_count
+
+    logger.info("[COLONY-DEBUG] noise_rejected_edge=%d", rejection_details['edge'])
+    logger.info("[COLONY-DEBUG] noise_rejected_center=%d", rejection_details['center'])
+    logger.info("[COLONY-DEBUG] noise_rejected_undersized=%d", rejection_details['undersized'])
+    logger.info("[COLONY-DEBUG] final_colony_count=%d", colony_count)
 
     avg_size = float(np.mean(colony_sizes)) if colony_sizes else 0.0
     avg_circ = float(np.mean(colony_circs)) if colony_circs else 0.0
 
     debug_info = {
-        'algorithm': 'opencfu_ladder_v1.8.0',
+        'algorithm': 'opencfu_ladder_v1.9.1',
+        'density_channel': density_channel,
+        'high_score_fraction': round(high_score_frac, 4),
         'sensitivity': round(sensitivity, 2),
         'colony_size': colony_size,
         'n_thresholds': params['n_thresholds'],
         'score_threshold_used': round(score_frac, 3),
+        'oversized_threshold_used': oversized_threshold,
+        'min_circularity_used': round(min_circularity, 3),
         'score_map_max': int(score_map.max()),
         'foreground_max': round(fg_max, 1),
         'foreground_mean': round(fg_mean, 1),
         'binary_mask_pixels': int(np.sum(binary_mask)),
         'segments_before_filter': n_segments,
+        'noise_rejected': noise_rejected,
         'colonies_after_filter': colony_count,
     }
 
@@ -674,7 +833,7 @@ def generate_decision(colony_count, hemolysis, media_type):
         growth = f"Low count ({colony_count} CFU)"
         confidence = "MEDIUM"
         review = True
-    elif colony_count <= 50:
+    elif colony_count <= 130:
         growth = f"Moderate growth ({colony_count} CFU)"
         confidence = "HIGH"
         review = False
@@ -702,32 +861,44 @@ def generate_decision(colony_count, hemolysis, media_type):
 
 # === MAIN ANALYSIS ===
 
-def analyze_plate(image_bytes, media_type='blood_agar', detection_mode='sensitive',
-                  colony_size='auto'):
-    """Main analysis function - v1.8.0 OpenCFU pipeline"""
-    img = load_and_resize_image(image_bytes)
+def _safe_plate_ratio(plate_mask, total_pixels):
+    """Safe division for plate coverage ratio."""
+    if total_pixels == 0:
+        return 0.0
+    return float(np.sum(plate_mask)) / total_pixels
+
+
+def _run_analysis(img, media_type, detection_mode, colony_size):
+    """Core analysis logic, separated for memory-fallback retry."""
     sensitivity = MODE_SENSITIVITY.get(detection_mode, 0.5)
     params = _adjust_params_for_sensitivity(sensitivity, colony_size)
     plate_mask, center, radius = create_plate_mask(
         img.shape, rgb_array=img, radius_factor=params['plate_radius_factor']
     )
 
+    total_pixels = img.shape[0] * img.shape[1]
+    plate_coverage = _safe_plate_ratio(plate_mask, total_pixels)
+
     # Safety net: if plate coverage is too low, expand radius by 10%
-    plate_coverage = np.sum(plate_mask) / (img.shape[0] * img.shape[1])
     if plate_coverage < 0.50:
         expanded_factor = min(params['plate_radius_factor'] * 1.10, 0.98)
         plate_mask, center, radius = create_plate_mask(
             img.shape, rgb_array=img, radius_factor=expanded_factor
         )
+        plate_coverage = _safe_plate_ratio(plate_mask, total_pixels)
 
     luminance = get_luminance(img)
 
     colony_count, avg_size, avg_circ, labeled, debug_info = colony_detection_opencfu(
-        img, luminance, plate_mask, sensitivity=sensitivity, colony_size=colony_size
+        img, luminance, plate_mask, sensitivity=sensitivity, colony_size=colony_size,
+        plate_center=center, plate_radius=radius
     )
 
     hemolysis = detect_hemolysis_hsv(img, plate_mask)
     decision = generate_decision(colony_count, hemolysis, media_type)
+
+    logger.info("Analysis complete: %d colonies detected (mode=%s, size=%s, image=%dx%d)",
+                colony_count, detection_mode, colony_size, img.shape[1], img.shape[0])
 
     return {
         'status': 'success',
@@ -746,11 +917,27 @@ def analyze_plate(image_bytes, media_type='blood_agar', detection_mode='sensitiv
             'center': list(center),
             'radius_px': radius,
             'analyzed_size': list(img.shape[:2]),
-            'plate_coverage_pct': round(100 * np.sum(plate_mask) / (img.shape[0] * img.shape[1]), 1)
+            'plate_coverage_pct': round(100 * plate_coverage, 1)
         },
         'debug': debug_info,
-        'version': '1.8.0-opencfu'
+        'version': '1.9.1'
     }
+
+
+def analyze_plate(image_bytes, media_type='blood_agar', detection_mode='sensitive',
+                  colony_size='auto'):
+    """Main analysis function - v1.9.1 OpenCFU pipeline with density channels."""
+    # Try at full resolution (1600px) first
+    try:
+        img = load_and_resize_image(image_bytes, max_size=MAX_IMAGE_SIZE)
+        return _run_analysis(img, media_type, detection_mode, colony_size)
+    except MemoryError:
+        logger.warning("MemoryError at %dpx, retrying at %dpx fallback",
+                       MAX_IMAGE_SIZE, FALLBACK_IMAGE_SIZE)
+        img = load_and_resize_image(image_bytes, max_size=FALLBACK_IMAGE_SIZE)
+        result = _run_analysis(img, media_type, detection_mode, colony_size)
+        result['debug']['fallback_resize'] = FALLBACK_IMAGE_SIZE
+        return result
 
 
 # === FLASK ROUTES ===
@@ -760,7 +947,7 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'version': '1.8.0-opencfu',
+        'version': '1.9.1',
         'max_image_size': MAX_IMAGE_SIZE,
         'supported_media_types': SUPPORTED_MEDIA_TYPES,
         'detection_modes': {
@@ -790,7 +977,7 @@ def warmup():
     """Warm-up endpoint"""
     return jsonify({
         'status': 'warm',
-        'version': '1.8.0-opencfu',
+        'version': '1.9.1',
         'message': 'Service is ready for analysis'
     })
 
@@ -837,10 +1024,10 @@ def analyze():
         }), 400
 
     except Exception as e:
+        logger.error("Analysis failed: %s\n%s", str(e), traceback.format_exc())
         return jsonify({
             'status': 'error',
-            'error': str(e),
-            'trace': traceback.format_exc()
+            'error': str(e)
         }), 500
 
 
