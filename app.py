@@ -30,6 +30,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
 from PIL import Image
+from scipy.ndimage import (
+    median_filter, gaussian_filter, label, find_objects,
+    distance_transform_edt, maximum_filter,
+    binary_closing, binary_opening, binary_fill_holes,
+    binary_erosion, binary_dilation,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -120,7 +126,6 @@ def load_and_resize_image(image_bytes, max_size=None):
 
 def apply_noise_reduction(gray_image, kernel_size=3):
     """Apply median filter for noise reduction"""
-    from scipy.ndimage import median_filter
     return median_filter(gray_image, size=kernel_size)
 
 
@@ -158,8 +163,6 @@ def get_luminance(rgb_array):
 
 def detect_plate_region(rgb_array):
     """Detect blood agar plate using HSV color space"""
-    from scipy.ndimage import binary_closing, binary_opening, binary_fill_holes
-
     hsv = rgb_to_hsv(rgb_array)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
 
@@ -200,8 +203,6 @@ def estimate_local_background(gray, plate_mask, sigma_fraction=0.15):
     to different image sizes. Smooths out colony-scale detail while
     preserving the illumination gradient.
     """
-    from scipy.ndimage import gaussian_filter
-
     h, w = gray.shape
     diagonal = np.sqrt(h ** 2 + w ** 2)
     sigma = max(20.0, sigma_fraction * diagonal)
@@ -227,8 +228,6 @@ def compute_foreground_signal(rgb_array, plate_mask):
     Compute foreground signal: median filter for noise reduction,
     then local background subtraction on luminance.
     """
-    from scipy.ndimage import median_filter
-
     luminance = get_luminance(rgb_array).astype(float)
     denoised = median_filter(luminance, size=3)
     foreground = subtract_background(denoised, plate_mask)
@@ -261,8 +260,6 @@ def build_score_map(foreground, plate_mask, n_thresholds=30,
     and accumulates a score map counting how many levels each pixel was valid.
     Colony centers score high (valid at many levels), noise scores low.
     """
-    from scipy.ndimage import label, find_objects
-
     fg_values = foreground[plate_mask & (foreground > 0)]
     if len(fg_values) == 0:
         return np.zeros_like(foreground, dtype=np.int32)
@@ -332,8 +329,6 @@ def _classify_density(score_map, plate_mask):
 def extract_colonies_from_score_map(score_map, plate_mask,
                                     score_threshold_fraction=0.3):
     """Threshold the score map to get a binary colony mask."""
-    from scipy.ndimage import binary_fill_holes, binary_opening
-
     max_score = score_map.max()
     if max_score == 0:
         return np.zeros_like(plate_mask, dtype=bool)
@@ -351,8 +346,6 @@ def extract_colonies_from_score_map(score_map, plate_mask,
 
 def _voronoi_split(binary_mask, markers, n_markers, min_area):
     """Voronoi partition by markers, then label connected components per territory."""
-    from scipy.ndimage import distance_transform_edt, label, find_objects
-
     marker_mask = (markers > 0)
     _, nearest_idx = distance_transform_edt(~marker_mask, return_indices=True)
     nearest_label = markers[nearest_idx[0], nearest_idx[1]]
@@ -395,10 +388,6 @@ def split_touching_colonies(binary_mask, foreground, min_area=6,
             conservative foreground intensity peaks (footprint 9, 70th
             percentile) to split only the most obvious merged clusters.
     """
-    from scipy.ndimage import (distance_transform_edt, label,
-                               maximum_filter, find_objects,
-                               gaussian_filter)
-
     if np.sum(binary_mask) == 0:
         return np.zeros_like(binary_mask, dtype=np.int32), 0
 
@@ -481,8 +470,6 @@ def calculate_circularity_robust(component_mask):
     - Small components (area < 25px): moments-based (inertia tensor eigenvalue ratio)
     - Larger components: erosion-based perimeter with Cauchy-Crofton correction
     """
-    from scipy.ndimage import binary_erosion
-
     area = int(np.sum(component_mask))
     if area == 0:
         return 0.0
@@ -531,8 +518,6 @@ def calculate_circularity_robust(component_mask):
 
 def filter_colonies(labeled, min_area, max_area, min_circularity):
     """Filter labeled regions by size and circularity, return re-labeled array."""
-    from scipy.ndimage import find_objects
-
     if labeled.max() == 0:
         return labeled, 0, [], []
 
@@ -576,8 +561,6 @@ def _filter_edge_and_center_noise(labeled, plate_mask, center, radius, colony_si
     - Low contrast: luminance difference between colony and 5px surround < 15 units
     Returns (labeled, count, sizes, circs, rejection_counts).
     """
-    from scipy.ndimage import find_objects, binary_dilation
-
     rejected_edge = 0
     rejected_center = 0
     rejected_undersized = 0
@@ -820,8 +803,6 @@ def detect_hemolysis_hsv(rgb_array, plate_mask):
     is_bright = v > (bg_v + 8)
     is_desaturated = s < (bg_s * 0.80)
     beta_zones = (is_bright | is_desaturated) & plate_mask
-
-    from scipy.ndimage import binary_dilation
 
     very_bright = v > (bg_v + 25)
     colony_cores = very_bright & plate_mask
