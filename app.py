@@ -25,6 +25,7 @@ import os
 import logging
 import traceback
 import base64
+import uuid
 from io import BytesIO
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -36,6 +37,10 @@ from scipy.ndimage import (
     binary_closing, binary_opening, binary_fill_holes,
     binary_erosion, binary_dilation,
 )
+from dotenv import load_dotenv
+from supabase import create_client
+
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -44,6 +49,94 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Supabase client (optional — app still runs without it)
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY')
+
+supabase = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        logger.info("Supabase client initialized")
+    except Exception as e:
+        logger.error("Failed to initialize Supabase client: %s", e)
+else:
+    logger.warning("Supabase not configured — image retention disabled")
+
+
+# Reliable image MIME → extension mapping (avoids mimetypes' .jpe/.jfif quirks)
+_IMAGE_EXTENSIONS = {
+    'image/jpeg': '.jpg',
+    'image/jpg':  '.jpg',
+    'image/pjpeg': '.jpg',
+    'image/png':  '.png',
+    'image/tiff': '.tiff',
+    'image/tif':  '.tiff',
+    'image/webp': '.webp',
+    'image/gif':  '.gif',
+    'image/bmp':  '.bmp',
+    'image/heic': '.heic',
+    'image/heif': '.heif',
+    'image/avif': '.avif',
+}
+_DEFAULT_CONTENT_TYPE = 'image/jpeg'
+_DEFAULT_EXTENSION = '.jpg'
+
+
+def _resolve_content_type(content_type):
+    """Normalize a content_type string to (content_type, extension).
+    Falls back to image/jpeg / .jpg when detection fails.
+    """
+    if not content_type:
+        return _DEFAULT_CONTENT_TYPE, _DEFAULT_EXTENSION
+    # Strip parameters like "; charset=..." and normalize case
+    ct = content_type.split(';', 1)[0].strip().lower()
+    ext = _IMAGE_EXTENSIONS.get(ct)
+    if ext:
+        return ct, ext
+    return _DEFAULT_CONTENT_TYPE, _DEFAULT_EXTENSION
+
+
+def _parse_image_base64(b64_str):
+    """Decode a possibly-data-URL base64 string.
+    Returns (image_bytes, detected_content_type_or_None).
+    Accepts both raw base64 and 'data:<mime>;base64,<payload>' forms.
+    """
+    detected = None
+    if isinstance(b64_str, str) and b64_str.startswith('data:'):
+        header, sep, body = b64_str.partition(',')
+        if sep:
+            # header looks like 'data:image/png;base64'
+            meta = header[5:]
+            detected = meta.split(';', 1)[0] or None
+            b64_str = body
+    return base64.b64decode(b64_str), detected
+
+
+def store_upload(image_bytes, count, density_channel, user_email=None,
+                 image_metadata=None, content_type=None):
+    """Persist uploaded image to Supabase Storage and log the analysis.
+    The filename extension and stored Content-Type are derived from the
+    caller-provided content_type, defaulting to image/jpeg.
+    """
+    resolved_ct, ext = _resolve_content_type(content_type)
+    filename = f"{uuid.uuid4()}{ext}"
+
+    supabase.storage.from_("colony-uploads").upload(
+        path=filename,
+        file=image_bytes,
+        file_options={"content-type": resolved_ct}
+    )
+
+    supabase.table("colony_analyses").insert({
+        "user_email": user_email,
+        "image_path": filename,
+        "colony_count": count,
+        "density_channel": density_channel,
+        "image_metadata": image_metadata,
+    }).execute()
+
 
 app = Flask(__name__)
 CORS(app)
@@ -1004,6 +1097,23 @@ def warmup():
     })
 
 
+def _persist_upload(image_bytes, result, user_email, image_metadata, content_type=None):
+    """Best-effort persistence to Supabase. Never raises."""
+    if supabase is None:
+        return
+    try:
+        store_upload(
+            image_bytes=image_bytes,
+            count=result.get('colony_count'),
+            density_channel=result.get('debug', {}).get('density_channel'),
+            user_email=user_email,
+            image_metadata=image_metadata,
+            content_type=content_type,
+        )
+    except Exception as e:
+        logger.error("Supabase storage failed (analysis still returned): %s", e)
+
+
 @app.route('/analyze', methods=['POST'])
 def analyze():
     """Analyze plate image"""
@@ -1025,12 +1135,28 @@ def analyze():
             if file and file.filename:
                 image_bytes = file.read()
                 result = analyze_plate(image_bytes, media_type, detection_mode, colony_size)
+                _persist_upload(
+                    image_bytes,
+                    result,
+                    user_email=request.form.get('user_email'),
+                    image_metadata={
+                        'original_filename': file.filename,
+                        'original_content_type': file.mimetype,
+                        'media_type': media_type,
+                        'detection_mode': detection_mode,
+                        'colony_size': colony_size,
+                        'source': 'multipart',
+                    },
+                    content_type=file.mimetype,
+                )
                 return jsonify(result)
 
         if request.is_json:
             data = request.get_json()
             if data and 'image_base64' in data:
-                image_bytes = base64.b64decode(data['image_base64'])
+                image_bytes, detected_ct = _parse_image_base64(data['image_base64'])
+                # Allow an explicit content_type field in the body to override
+                content_type = data.get('content_type') or detected_ct
                 dm = data.get('detection_mode', 'sensitive')
                 if dm not in DETECTION_MODES:
                     dm = 'sensitive'
@@ -1038,6 +1164,19 @@ def analyze():
                 if cs not in COLONY_SIZES:
                     cs = 'auto'
                 result = analyze_plate(image_bytes, media_type, dm, cs)
+                _persist_upload(
+                    image_bytes,
+                    result,
+                    user_email=data.get('user_email'),
+                    image_metadata={
+                        'original_content_type': content_type,
+                        'media_type': media_type,
+                        'detection_mode': dm,
+                        'colony_size': cs,
+                        'source': 'json_base64',
+                    },
+                    content_type=content_type,
+                )
                 return jsonify(result)
 
         return jsonify({
